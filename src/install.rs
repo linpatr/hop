@@ -37,7 +37,22 @@ mod imp {
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join("Hop.exe");
         let me = std::env::current_exe()?;
-        std::fs::copy(&me, &dest).context("couldn't copy Hop.exe (is an installed Hop still running? quit it first)")?;
+        // Updating: close the installed copy (but not this one) so it can be replaced.
+        if dest.exists() {
+            let d = dest.display().to_string().replace('\'', "''");
+            powershell(&format!(
+                "Get-Process -Name Hop -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -eq '{d}' }} | Stop-Process -Force"
+            ));
+        }
+        let mut copied = Err(std::io::Error::other("not tried"));
+        for _ in 0..20 {
+            copied = std::fs::copy(&me, &dest);
+            if copied.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        copied.context("couldn't replace the installed Hop.exe (quit Hop and try again)")?;
         // Drop the downloaded-from-the-internet mark so SmartScreen doesn't ask again.
         let _ = std::fs::remove_file(format!("{}:Zone.Identifier", dest.display()));
         let (d, dd) = (dest.display().to_string(), dir.display().to_string());

@@ -13,7 +13,7 @@ use crate::clipboard::ClipState;
 use crate::crypto::{HostRefused, PacketCipher, SessionKeys, StreamCipher, client_handshake, read_frame, write_frame};
 use crate::media::{KIND_AUDIO, KIND_PUNCH, KIND_VIDEO, Reassembler, decode_audio};
 use crate::platform::{self, DecodeStatus, Nv12Frame};
-use crate::proto::{CONTROL_PORT, Ctrl, Hello, Input, MEDIA_PORT, Message, PROTOCOL_VERSION, decode_message, encode_ctrl, encode_input};
+use crate::proto::{control_port, Ctrl, CursorMsg, Hello, Input, media_port, Message, PROTOCOL_VERSION, decode_message, encode_ctrl, encode_input};
 
 #[derive(Clone)]
 pub struct ConnectOptions {
@@ -74,7 +74,7 @@ pub struct Connection {
 }
 
 pub fn resolve(addr: &str) -> Result<SocketAddr> {
-    let with_port = if addr.contains(':') { addr.to_string() } else { format!("{addr}:{CONTROL_PORT}") };
+    let with_port = if addr.contains(':') { addr.to_string() } else { format!("{addr}:{}", control_port()) };
     with_port
         .to_socket_addrs()
         .with_context(|| format!("can't resolve {addr}"))?
@@ -138,7 +138,7 @@ pub fn connect(o: &ConnectOptions) -> Result<Connection, ConnectError> {
         tx,
         rx,
         keys,
-        host_media: SocketAddr::new(addr.ip(), MEDIA_PORT),
+        host_media: SocketAddr::new(addr.ip(), media_port()),
         audio: o.audio,
         clipboard: o.clipboard,
     })
@@ -160,11 +160,14 @@ pub struct ClientStats {
 
 pub enum Event {
     Frame,
+    Cursor,
     Closed(String),
 }
 
 pub struct ClientShared {
     pub frame: Mutex<Option<Nv12Frame>>,
+    /// Latest pointer update from the host, waiting for the window to apply it.
+    pub cursor: Mutex<Option<CursorMsg>>,
     pub spare: Mutex<Vec<Nv12Frame>>,
     pub stats: Mutex<ClientStats>,
     pub stop: AtomicBool,
@@ -215,6 +218,7 @@ pub fn start(conn: Connection, notify: impl Fn(Event) + Send + Sync + 'static) -
     tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
     let shared = Arc::new(ClientShared {
         frame: Mutex::new(None),
+        cursor: Mutex::new(None),
         spare: Mutex::new(Vec::new()),
         stats: Mutex::new(ClientStats { width: info.width, height: info.height, ..Default::default() }),
         stop: AtomicBool::new(false),
@@ -251,6 +255,14 @@ pub fn start(conn: Connection, notify: impl Fn(Event) + Send + Sync + 'static) -
                 };
                 let Ok(pt) = rx.open(&f) else { break "Corrupt data from host".into() };
                 match decode_message(&pt) {
+                    Ok(Message::Cursor(c)) => {
+                        let mut slot = shared.cursor.lock();
+                        // A visibility-only update mustn't drop a shape the window hasn't applied yet.
+                        let shape = c.shape.or_else(|| slot.take().and_then(|p| p.shape));
+                        *slot = Some(CursorMsg { visible: c.visible, shape });
+                        drop(slot);
+                        notify(Event::Cursor);
+                    }
                     Ok(Message::Ctrl(Ctrl::Pong { ts })) => {
                         let now = platform::now_us();
                         *rtt.lock() = now.saturating_sub(ts) as f32 / 1000.0;

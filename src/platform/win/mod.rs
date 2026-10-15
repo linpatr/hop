@@ -92,6 +92,10 @@ pub(crate) struct CaptureShared {
     pub keyframe: AtomicBool,
     pub bitrate_kbps: AtomicU32,
     pub frames_captured: AtomicU64,
+    /// Draw the pointer into the video (off when the viewer draws it locally).
+    pub cursor_in_video: AtomicBool,
+    /// Re-convert the last frame even without a screen change (e.g. to add/remove the pointer).
+    pub redraw: AtomicBool,
 }
 
 impl CaptureShared {
@@ -149,15 +153,18 @@ pub fn start_capture(cfg: &CaptureConfig, sink: SharedSink) -> Result<Box<dyn Ca
         keyframe: AtomicBool::new(true),
         bitrate_kbps: AtomicU32::new(cfg.bitrate_kbps),
         frames_captured: AtomicU64::new(0),
+        cursor_in_video: AtomicBool::new(true),
+        redraw: AtomicBool::new(false),
     });
     let (w, h) = (cfg.width, cfg.height);
     let fps = cfg.fps;
 
     let (cap_tx, cap_rx) = std::sync::mpsc::channel::<Result<()>>();
     let sh = shared.clone();
+    let cap_sink = sink.clone();
     let cap = std::thread::Builder::new()
         .name("dxgi-capture".into())
-        .spawn(move || dxgi::capture_thread(sh, scale, (w, h), cap_tx))?;
+        .spawn(move || dxgi::capture_thread(sh, cap_sink, scale, (w, h), cap_tx))?;
     match cap_rx.recv_timeout(Duration::from_secs(10)) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -207,6 +214,11 @@ pub fn start_capture(cfg: &CaptureConfig, sink: SharedSink) -> Result<Box<dyn Ca
 }
 
 impl Capturer for WinCapturer {
+    fn set_cursor_in_video(&self, on: bool) {
+        if self.shared.cursor_in_video.swap(on, Ordering::AcqRel) != on {
+            self.shared.redraw.store(true, Ordering::Release);
+        }
+    }
     fn request_keyframe(&self) {
         self.shared.keyframe.store(true, Ordering::Release);
         self.shared.cv.notify_all();

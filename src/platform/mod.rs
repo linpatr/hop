@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::proto::Input;
+use crate::proto::{CursorShape, Input};
 
 #[cfg(target_os = "macos")]
 mod mac;
@@ -30,10 +30,14 @@ pub trait FrameSink: Send + Sync {
     fn video(&self, data: &[u8], keyframe: bool, capture_us: u64);
     /// Interleaved stereo PCM at 48 kHz.
     fn audio(&self, pcm: &[i16]);
+    /// The host's mouse pointer was shown/hidden or changed shape (`shape` is set when it changed).
+    fn cursor(&self, _visible: bool, _shape: Option<&CursorShape>) {}
 }
 
 /// A running screen capture + encoder. Dropping it stops capture.
 pub trait Capturer: Send {
+    /// Whether the mouse pointer is drawn into the video (off when the viewer draws it locally).
+    fn set_cursor_in_video(&self, on: bool);
     fn request_keyframe(&self);
     fn set_bitrate(&self, kbps: u32);
     fn encoder_name(&self) -> String;

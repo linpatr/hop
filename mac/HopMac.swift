@@ -14,6 +14,7 @@ import VideoToolbox
 
 public typealias HopVideoCB = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, Int32, UInt64) -> Void
 public typealias HopAudioCB = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<Int16>?, Int) -> Void
+public typealias HopCursorCB = @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<UInt8>?, Int32, Int32, Int32, Int32) -> Void
 public typealias HopDecodedCB = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UnsafePointer<UInt8>?, Int, Int32, Int32) -> Void
 
 private func nowUs() -> UInt64 { UInt64(CACurrentMediaTime() * 1_000_000) }
@@ -53,6 +54,11 @@ final class HostSession: NSObject, SCStreamOutput, SCStreamDelegate {
     let ctx: UnsafeMutableRawPointer?
     let videoCB: HopVideoCB
     let audioCB: HopAudioCB
+    let cursorCB: HopCursorCB
+    var config: SCStreamConfiguration?
+    var cursorTimer: DispatchSourceTimer?
+    var lastCursorHash = 0
+    var lastCursorVisible = true
     let width: Int32, height: Int32, fps: Int32
     var bitrateKbps: Int32
     let wantAudio: Bool
@@ -69,9 +75,76 @@ final class HostSession: NSObject, SCStreamOutput, SCStreamDelegate {
     var out = [UInt8]()
     var pcm = [Int16]()
 
-    init(w: Int32, h: Int32, fps: Int32, kbps: Int32, audio: Bool, ctx: UnsafeMutableRawPointer?, v: @escaping HopVideoCB, a: @escaping HopAudioCB) {
+    init(w: Int32, h: Int32, fps: Int32, kbps: Int32, audio: Bool, ctx: UnsafeMutableRawPointer?, v: @escaping HopVideoCB,
+         a: @escaping HopAudioCB, c: @escaping HopCursorCB) {
         self.width = w; self.height = h; self.fps = fps; self.bitrateKbps = kbps
-        self.wantAudio = audio; self.ctx = ctx; self.videoCB = v; self.audioCB = a
+        self.wantAudio = audio; self.ctx = ctx; self.videoCB = v; self.audioCB = a; self.cursorCB = c
+    }
+
+    // MARK: pointer shape
+
+    let cursorQueue = DispatchQueue(label: "hop.cursor", qos: .userInteractive)
+
+    func startCursorPoller() {
+        // Not the main queue: the headless host (`hop host`) never runs the main run loop.
+        let t = DispatchSource.makeTimerSource(queue: cursorQueue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(33))
+        t.setEventHandler { [weak self] in self?.pollCursor() }
+        t.resume()
+        cursorTimer = t
+    }
+
+    func pollCursor() {
+        lock.lock()
+        let stop = stopped
+        lock.unlock()
+        if stop { return }
+        guard let cur = NSCursor.currentSystem else {
+            if lastCursorVisible {
+                lastCursorVisible = false
+                cursorCB(ctx, 0, nil, 0, 0, 0, 0)
+            }
+            return
+        }
+        let img = cur.image
+        let hot = cur.hotSpot
+        let w = Int(img.size.width.rounded()), h = Int(img.size.height.rounded())
+        guard w > 0, h > 0, w <= 256, h <= 256 else { return }
+        var data = [UInt8](repeating: 0, count: w * h * 4)
+        data.withUnsafeMutableBytes { buf in
+            guard let cg = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                     space: CGColorSpaceCreateDeviceRGB(),
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: cg, flipped: false)
+            img.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        // Premultiplied -> straight alpha.
+        for i in stride(from: 0, to: data.count, by: 4) {
+            let a = Int(data[i + 3])
+            if a > 0 && a < 255 {
+                for k in 0..<3 { data[i + k] = UInt8(min(255, Int(data[i + k]) * 255 / a)) }
+            }
+        }
+        var hasher = Hasher()
+        hasher.combine(data)
+        hasher.combine(Int(hot.x)); hasher.combine(Int(hot.y))
+        let hash = hasher.finalize()
+        if hash == lastCursorHash && lastCursorVisible { return }
+        lastCursorHash = hash
+        lastCursorVisible = true
+        data.withUnsafeBufferPointer { p in
+            cursorCB(ctx, 1, p.baseAddress, Int32(w), Int32(h), Int32(hot.x.rounded()), Int32(hot.y.rounded()))
+        }
+    }
+
+    func setShowCursor(_ on: Bool) {
+        guard let stream, let config, config.showsCursor != on else { return }
+        config.showsCursor = on
+        stream.updateConfiguration(config) { err in
+            if let err { NSLog("hop: updateConfiguration failed: \(err)") }
+        }
     }
 
     func start() throws {
@@ -118,6 +191,8 @@ final class HostSession: NSObject, SCStreamOutput, SCStreamDelegate {
         sem.wait()
         if let startErr { throw HopError("startCapture failed: \(startErr)") }
         stream = s
+        config = cfg
+        startCursorPoller()
     }
 
     func setupEncoder() throws {
@@ -175,6 +250,9 @@ final class HostSession: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         lock.lock(); stopped = true; lock.unlock()
+        if let t = cursorTimer { t.cancel() }
+        cursorTimer = nil
+        cursorQueue.sync {}
         if let stream {
             let sem = DispatchSemaphore(value: 0)
             stream.stopCapture { _ in sem.signal() }
@@ -321,9 +399,9 @@ final class HostSession: NSObject, SCStreamOutput, SCStreamDelegate {
 
 @_cdecl("hop_mac_host_start")
 public func hop_mac_host_start(_ w: Int32, _ h: Int32, _ fps: Int32, _ kbps: Int32, _ audio: Int32,
-                               _ ctx: UnsafeMutableRawPointer?, _ vcb: HopVideoCB, _ acb: HopAudioCB,
+                               _ ctx: UnsafeMutableRawPointer?, _ vcb: HopVideoCB, _ acb: HopAudioCB, _ ccb: HopCursorCB,
                                _ err: UnsafeMutablePointer<CChar>?, _ errLen: Int) -> UnsafeMutableRawPointer? {
-    let s = HostSession(w: w, h: h, fps: fps, kbps: kbps, audio: audio != 0, ctx: ctx, v: vcb, a: acb)
+    let s = HostSession(w: w, h: h, fps: fps, kbps: kbps, audio: audio != 0, ctx: ctx, v: vcb, a: acb, c: ccb)
     do {
         try s.start()
     } catch {
@@ -343,6 +421,12 @@ public func hop_mac_host_stop(_ h: UnsafeMutableRawPointer) {
 @_cdecl("hop_mac_host_request_keyframe")
 public func hop_mac_host_request_keyframe(_ h: UnsafeMutableRawPointer) {
     Unmanaged<HostSession>.fromOpaque(h).takeUnretainedValue().requestKeyframe()
+}
+
+@_cdecl("hop_mac_host_set_show_cursor")
+public func hop_mac_host_set_show_cursor(_ h: UnsafeMutableRawPointer, _ on: Int32) {
+    let s = Unmanaged<HostSession>.fromOpaque(h).takeUnretainedValue()
+    DispatchQueue.main.async { s.setShowCursor(on != 0) }
 }
 
 @_cdecl("hop_mac_host_set_bitrate")

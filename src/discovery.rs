@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::proto::{CONTROL_PORT, DISCOVERY_PORT, PROTOCOL_VERSION};
+use crate::proto::{PROTOCOL_VERSION, control_port, discovery_port};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Beacon {
@@ -35,14 +35,14 @@ impl Peer {
 }
 
 fn broadcast_targets() -> Vec<SocketAddr> {
-    let mut v = vec![SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))];
+    let mut v = vec![SocketAddr::from((Ipv4Addr::BROADCAST, discovery_port()))];
     if let Ok(ifs) = if_addrs::get_if_addrs() {
         for i in ifs {
             if let if_addrs::IfAddr::V4(a) = i.addr
                 && !a.ip.is_loopback()
                 && let Some(b) = a.broadcast
             {
-                let t = SocketAddr::from((b, DISCOVERY_PORT));
+                let t = SocketAddr::from((b, discovery_port()));
                 if !v.contains(&t) {
                     v.push(t);
                 }
@@ -79,7 +79,7 @@ pub fn start_beacon(id: String, name: String, stop: Arc<AtomicBool>) {
                 id,
                 name,
                 os: crate::proto::os_name().into(),
-                port: CONTROL_PORT,
+                port: control_port(),
             })
             .unwrap();
             let mut targets = broadcast_targets();
@@ -115,7 +115,7 @@ impl Browser {
         std::thread::Builder::new()
             .name("discovery".into())
             .spawn(move || {
-                let sock = match bind_shared(DISCOVERY_PORT) {
+                let sock = match bind_shared(discovery_port()) {
                     Ok(s) => s,
                     Err(e) => {
                         log::warn!("discovery listener failed: {e}");

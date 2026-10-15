@@ -13,7 +13,7 @@ use crate::clipboard::ClipState;
 use crate::crypto::{PacketCipher, StreamCipher, host_handshake, host_refuse, read_frame, write_frame};
 use crate::media::{AUDIO_FRAMES_PER_PACKET, KIND_AUDIO, KIND_PUNCH, KIND_VIDEO, Packetizer, encode_audio};
 use crate::platform::{self, CaptureConfig, Capturer, FrameSink};
-use crate::proto::{CONTROL_PORT, Ctrl, Hello, Input, MEDIA_PORT, Message, PROTOCOL_VERSION, decode_message, encode_ctrl};
+use crate::proto::{control_port, Ctrl, Hello, Input, media_port, Message, PROTOCOL_VERSION, decode_message, encode_ctrl};
 
 pub struct HostOptions {
     pub id: String,
@@ -99,16 +99,16 @@ fn media_socket() -> Result<UdpSocket> {
     let _ = s.set_recv_buffer_size(1 << 20);
     // DSCP AF41: Wi-Fi access points put this in the video queue.
     let _ = s.set_tos_v4(0x88);
-    s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MEDIA_PORT)).into())
-        .with_context(|| format!("UDP port {MEDIA_PORT} is in use (is Hop already running?)"))?;
+    s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, media_port())).into())
+        .with_context(|| format!("UDP port {} is in use (is Hop already running?)", media_port()))?;
     let s: UdpSocket = s.into();
     s.set_read_timeout(Some(Duration::from_millis(250)))?;
     Ok(s)
 }
 
 pub fn start_host(opts: HostOptions) -> Result<Host> {
-    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, CONTROL_PORT))
-        .with_context(|| format!("TCP port {CONTROL_PORT} is in use (is Hop already running?)"))?;
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, control_port()))
+        .with_context(|| format!("TCP port {} is in use (is Hop already running?)", control_port()))?;
     listener.set_nonblocking(true)?;
     let media = Arc::new(media_socket()?);
     let status = Arc::new(Mutex::new(HostStatus { running: true, ..Default::default() }));
@@ -132,7 +132,7 @@ pub fn start_host(opts: HostOptions) -> Result<Host> {
     let sh = shared.clone();
     std::thread::Builder::new().name("host-punch".into()).spawn(move || punch_loop(sh))?;
 
-    log::info!("hosting \"{}\" on TCP {CONTROL_PORT} / UDP {MEDIA_PORT}", shared.name);
+    log::info!("hosting \"{}\" on TCP {} / UDP {}", shared.name, control_port(), media_port());
     Ok(Host { status, shared })
 }
 
@@ -313,6 +313,8 @@ fn run_session(
     let sent_bytes = Arc::new(AtomicU64::new(0));
     let sink = Arc::new(HostSink {
         sock: shared.media.clone(),
+        writer: writer.clone(),
+        last_cursor: Mutex::new(Vec::new()),
         active: active.clone(),
         cipher: PacketCipher::new(media_key),
         seq: AtomicU64::new(0),
@@ -368,8 +370,21 @@ fn run_session(
             Ok(f) => f,
             Err(_) => break,
         };
-        match decode_message(&rx.open(&frame)?)? {
+        let msg = match decode_message(&rx.open(&frame)?) {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("ignoring message: {e}");
+                continue;
+            }
+        };
+        match msg {
             Message::Input(i) => injector.input(i),
+            Message::Ctrl(Ctrl::CursorMode { local }) => {
+                log::info!("pointer drawn {}", if local { "by the viewer" } else { "in the video" });
+                if let Some(c) = active.capturer.lock().as_ref() {
+                    c.set_cursor_in_video(!local);
+                }
+            }
             Message::Ctrl(Ctrl::RequestKeyframe) => {
                 if let Some(c) = active.capturer.lock().as_ref() {
                     c.request_keyframe();
@@ -387,7 +402,7 @@ fn run_session(
                 }
             }
             Message::Ctrl(Ctrl::Bye) => break,
-            Message::Ctrl(_) => {}
+            Message::Ctrl(_) | Message::Cursor(_) => {}
         }
     }
     clip_stop.store(true, Ordering::SeqCst);
@@ -404,6 +419,9 @@ struct AudioState {
 
 struct HostSink {
     sock: Arc<UdpSocket>,
+    /// Control channel, for pointer updates.
+    writer: Writer,
+    last_cursor: Mutex<Vec<u8>>,
     active: Arc<Active>,
     cipher: PacketCipher,
     seq: AtomicU64,
@@ -431,6 +449,24 @@ impl HostSink {
 }
 
 impl FrameSink for HostSink {
+    fn cursor(&self, visible: bool, shape: Option<&crate::proto::CursorShape>) {
+        let msg = crate::proto::encode_cursor(visible, shape);
+        {
+            let mut last = self.last_cursor.lock();
+            if *last == msg {
+                return;
+            }
+            *last = msg.clone();
+        }
+        match shape {
+            Some(c) => log::debug!("pointer shape {}x{} hotspot {},{} visible {visible}", c.w, c.h, c.hot_x, c.hot_y),
+            None => log::debug!("pointer visible {visible}"),
+        }
+        let mut g = self.writer.lock();
+        let (s, tx) = &mut *g;
+        let _ = write_frame(s, &tx.seal(&msg));
+    }
+
     fn video(&self, data: &[u8], keyframe: bool, capture_us: u64) {
         let Some(addr) = *self.active.client_addr.lock() else { return };
         let latency = platform::now_us().saturating_sub(capture_us).min(u32::MAX as u64) as u32;

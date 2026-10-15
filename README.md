@@ -23,6 +23,7 @@ Then, on either computer, click **Connect** next to the other one. The first tim
 - **Rename** sets the name your other computers see.
 - Closing the Hop window keeps hosting in the background (minimized). **Quit Hop** at the bottom really quits.
 - If Wi-Fi drops for a moment, the viewer reconnects by itself (for up to 30 seconds).
+- The mouse pointer is your own computer's, so it never lags. It takes the remote pointer's shape (arrow, text cursor, resize arrows). With the mouse locked for games (M), the remote computer draws its pointer into the video instead.
 - Five wrong access codes lock the host for a minute, and the viewer says so.
 
 ### Shortcuts while connected (Mac: Ctrl+Option+Shift)
@@ -88,7 +89,6 @@ Code map: `src/platform/` (mac.rs + `mac/HopMac.swift`, win/), `host.rs`, `clien
 ## Limits (for now)
 
 - Streams the main display only.
-- The mouse pointer is drawn into the video, so it lags by the stream latency (~1 frame on a good LAN).
 - On Windows it can't see or control the UAC prompt, the lock screen, or windows of apps running as administrator (that needs a system service).
 - One viewer at a time; a new connection replaces the old one.
 - No gamepad forwarding.

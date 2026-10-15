@@ -126,8 +126,8 @@ pub fn run() -> i32 {
     }
 
     for (name, r) in [
-        ("TCP 47121", TcpListener::bind((Ipv4Addr::UNSPECIFIED, crate::proto::CONTROL_PORT)).map(|_| ())),
-        ("UDP 47122", std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, crate::proto::MEDIA_PORT)).map(|_| ())),
+        ("TCP 47121", TcpListener::bind((Ipv4Addr::UNSPECIFIED, crate::proto::control_port())).map(|_| ())),
+        ("UDP 47122", std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, crate::proto::media_port())).map(|_| ())),
     ] {
         match r {
             Ok(()) => say!("port {name} free"),

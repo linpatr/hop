@@ -13,7 +13,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use winit::window::{CursorGrabMode, CustomCursor, Fullscreen, Window, WindowId};
 
 use crate::client::{self, ClientShared, ConnectError, ConnectOptions, Connection, Event};
 use crate::keymap;
@@ -22,6 +22,7 @@ use crate::render::{Overlay, Renderer};
 
 pub enum UserEvent {
     Frame,
+    Cursor,
     Closed(String),
     /// A key captured by the system-wide keyboard grab.
     Key { hid: u16, down: bool, repeat: bool },
@@ -81,6 +82,13 @@ struct App {
     hotkey_keys: std::collections::HashSet<u16>,
     key_grab: bool,
     mouse_locked: bool,
+    /// The host's pointer is showing (apps like video players and games hide it).
+    remote_cursor_visible: bool,
+    /// Only trust "hidden" once the host has reported a visible pointer: Windows reports it hidden
+    /// on PCs with no mouse plugged in, and the pointer must never just vanish.
+    remote_cursor_seen: bool,
+    /// Pointer images from the host, by content hash.
+    cursors: std::collections::HashMap<u64, CustomCursor>,
     show_stats: bool,
     toast: Option<(Vec<String>, Instant)>,
     reconnecting: Option<Instant>,
@@ -124,6 +132,9 @@ pub fn run(settings: StreamSettings) -> i32 {
         hotkey_keys: Default::default(),
         key_grab: false,
         mouse_locked: false,
+        remote_cursor_visible: true,
+        remote_cursor_seen: false,
+        cursors: Default::default(),
         show_stats: false,
         toast: None,
         reconnecting: None,
@@ -200,7 +211,6 @@ impl App {
             }));
             log::info!("system shortcut capture: {}", if self.key_grab { "on" } else { "unavailable" });
         }
-        window.set_cursor_visible(false);
         window.focus_window();
         #[cfg(target_os = "macos")]
         crate::platform::activate_self();
@@ -230,12 +240,16 @@ impl App {
         match client::start(conn, move |e| {
             let _ = proxy.send_event(match e {
                 Event::Frame => UserEvent::Frame,
+                Event::Cursor => UserEvent::Cursor,
                 Event::Closed(r) => UserEvent::Closed(r),
             });
         }) {
             Ok(s) => {
+                // Draw the pointer here, without lag; the host sends its shape.
+                s.send_ctrl(&crate::proto::Ctrl::CursorMode { local: !self.mouse_locked });
                 self.session = Some(s);
                 self.reconnecting = None;
+                self.update_cursor_visibility();
                 true
             }
             Err(e) => {
@@ -307,14 +321,55 @@ impl App {
             let _ = w.set_cursor_grab(CursorGrabMode::None);
             self.mouse_locked = false;
         }
-        w.set_cursor_visible(false);
         self.rel_accum = (0.0, 0.0);
+        // While locked (games), the host draws its pointer into the video instead.
+        if let Some(s) = &self.session {
+            s.send_ctrl(&crate::proto::Ctrl::CursorMode { local: !self.mouse_locked });
+        }
+        self.update_cursor_visibility();
         if self.mouse_locked {
             self.toast(vec!["Mouse locked to this window".into(), format!("{}+M to release", shortcut_prefix())], 3);
         } else if on {
             self.toast(vec!["Couldn't lock the mouse".into()], 3);
         } else {
             self.toast(vec!["Mouse released".into()], 2);
+        }
+    }
+
+    fn update_cursor_visibility(&self) {
+        if let Some(w) = &self.window {
+            let remote_hidden = self.remote_cursor_seen && !self.remote_cursor_visible;
+            w.set_cursor_visible(!self.mouse_locked && !remote_hidden);
+        }
+    }
+
+    /// Mirrors the host's pointer shape and visibility on our own cursor.
+    fn apply_cursor(&mut self, el: &ActiveEventLoop) {
+        let Some(msg) = self.session.as_ref().and_then(|s| s.cursor.lock().take()) else { return };
+        if let Some(shape) = msg.shape {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (&shape.rgba, shape.w, shape.h, shape.hot_x, shape.hot_y).hash(&mut h);
+            let key = h.finish();
+            if !self.cursors.contains_key(&key) {
+                match CustomCursor::from_rgba(shape.rgba, shape.w, shape.h, shape.hot_x, shape.hot_y) {
+                    Ok(src) => {
+                        if self.cursors.len() > 64 {
+                            self.cursors.clear();
+                        }
+                        self.cursors.insert(key, el.create_custom_cursor(src));
+                    }
+                    Err(e) => log::warn!("bad pointer image: {e}"),
+                }
+            }
+            if let (Some(c), Some(w)) = (self.cursors.get(&key), &self.window) {
+                w.set_cursor(c.clone());
+            }
+        }
+        self.remote_cursor_seen |= msg.visible;
+        if msg.visible != self.remote_cursor_visible {
+            self.remote_cursor_visible = msg.visible;
+            self.update_cursor_visibility();
         }
     }
 
@@ -468,6 +523,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.got_frame = true;
                 self.paint();
             }
+            UserEvent::Cursor => self.apply_cursor(el),
             UserEvent::Key { hid, down, repeat } => {
                 if self.focused {
                     self.on_key(el, hid, down, repeat);
@@ -533,16 +589,6 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 if !self.mouse_locked {
                     self.mouse_abs(position);
-                }
-            }
-            WindowEvent::CursorEntered { .. } => {
-                if let Some(w) = &self.window {
-                    w.set_cursor_visible(false);
-                }
-            }
-            WindowEvent::CursorLeft { .. } => {
-                if let Some(w) = &self.window {
-                    w.set_cursor_visible(true);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {

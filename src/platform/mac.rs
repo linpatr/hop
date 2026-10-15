@@ -10,6 +10,7 @@ use crate::proto::Input;
 
 type VideoCb = extern "C" fn(*mut c_void, *const u8, usize, i32, u64);
 type AudioCb = extern "C" fn(*mut c_void, *const i16, usize);
+type CursorCb = extern "C" fn(*mut c_void, i32, *const u8, i32, i32, i32, i32);
 type DecodedCb = extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize, i32, i32);
 type KeyCb = extern "C" fn(*mut c_void, u16, i32, i32);
 
@@ -25,12 +26,14 @@ unsafe extern "C" {
         ctx: *mut c_void,
         vcb: VideoCb,
         acb: AudioCb,
+        ccb: CursorCb,
         err: *mut c_char,
         err_len: usize,
     ) -> *mut c_void;
     fn hop_mac_host_stop(h: *mut c_void);
     fn hop_mac_host_request_keyframe(h: *mut c_void);
     fn hop_mac_host_set_bitrate(h: *mut c_void, kbps: i32);
+    fn hop_mac_host_set_show_cursor(h: *mut c_void, on: i32);
     fn hop_mac_dec_create(ctx: *mut c_void, cb: DecodedCb) -> *mut c_void;
     fn hop_mac_dec_decode(h: *mut c_void, data: *const u8, len: usize) -> i32;
     fn hop_mac_dec_destroy(h: *mut c_void);
@@ -143,6 +146,23 @@ extern "C" fn audio_cb(ctx: *mut c_void, pcm: *const i16, frames: usize) {
     sink.audio(unsafe { std::slice::from_raw_parts(pcm, frames * 2) });
 }
 
+extern "C" fn cursor_cb(ctx: *mut c_void, visible: i32, rgba: *const u8, w: i32, h: i32, hx: i32, hy: i32) {
+    let sink = unsafe { &*(ctx as *const SharedSink) };
+    if rgba.is_null() || w <= 0 || h <= 0 {
+        sink.cursor(visible != 0, None);
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(rgba, (w * h * 4) as usize) }.to_vec();
+    let shape = crate::proto::CursorShape {
+        w: w as u16,
+        h: h as u16,
+        hot_x: hx.clamp(0, w - 1) as u16,
+        hot_y: hy.clamp(0, h - 1) as u16,
+        rgba: data,
+    };
+    sink.cursor(visible != 0, Some(&shape));
+}
+
 pub fn start_capture(cfg: &CaptureConfig, sink: SharedSink) -> Result<Box<dyn Capturer>> {
     let sink = Box::into_raw(Box::new(sink));
     let mut err = [0 as c_char; 512];
@@ -156,6 +176,7 @@ pub fn start_capture(cfg: &CaptureConfig, sink: SharedSink) -> Result<Box<dyn Ca
             sink as *mut c_void,
             video_cb,
             audio_cb,
+            cursor_cb,
             err.as_mut_ptr(),
             err.len(),
         )
@@ -169,6 +190,9 @@ pub fn start_capture(cfg: &CaptureConfig, sink: SharedSink) -> Result<Box<dyn Ca
 }
 
 impl Capturer for MacCapturer {
+    fn set_cursor_in_video(&self, on: bool) {
+        unsafe { hop_mac_host_set_show_cursor(self.handle, on as i32) }
+    }
     fn request_keyframe(&self) {
         unsafe { hop_mac_host_request_keyframe(self.handle) }
     }

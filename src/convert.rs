@@ -122,6 +122,37 @@ pub fn cursor_from_dxgi(kind: u32, w: usize, h_raw: usize, pitch: usize, data: &
     Some(c)
 }
 
+/// RGBA for drawing the pointer locally on the viewer. "Invert" pixels (the classic I-beam) can't
+/// be shown that way, so they become white with a black outline, which reads on any background.
+pub fn cursor_to_rgba(c: &CursorImage) -> Vec<u8> {
+    let mut out = vec![0u8; c.w * c.h * 4];
+    for i in 0..c.w * c.h {
+        let s = &c.bgra[i * 4..i * 4 + 4];
+        let o = &mut out[i * 4..i * 4 + 4];
+        if c.xor[i] {
+            o.copy_from_slice(&[255, 255, 255, 255]);
+        } else {
+            o.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        }
+    }
+    for y in 0..c.h {
+        for x in 0..c.w {
+            let i = y * c.w + x;
+            if out[i * 4 + 3] != 0 {
+                continue;
+            }
+            let near_xor = [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)].iter().any(|(dx, dy)| {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                nx >= 0 && ny >= 0 && (nx as usize) < c.w && (ny as usize) < c.h && c.xor[ny as usize * c.w + nx as usize]
+            });
+            if near_xor {
+                out[i * 4..i * 4 + 4].copy_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+    }
+    out
+}
+
 /// Draws the cursor (top-left at `cx`, `cy`) into a BGRA buffer.
 pub fn blend_cursor(dst: &mut [u8], stride: usize, dw: usize, dh: usize, c: &CursorImage, cx: i32, cy: i32) {
     for y in 0..c.h {

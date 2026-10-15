@@ -24,6 +24,8 @@ use windows::core::Interface;
 
 use super::{CaptureShared, RawFrame, now_us};
 use crate::convert::{self, CursorImage};
+use crate::platform::SharedSink;
+use crate::proto::CursorShape;
 
 fn primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput)> {
     unsafe {
@@ -66,8 +68,11 @@ struct Duplicator {
     height: u32,
     have_frame: bool,
     cursor: Option<CursorImage>,
+    cursor_hotspot: (i32, i32),
     cursor_pos: (i32, i32),
     cursor_visible: bool,
+    /// Pointer changes not yet reported to the viewer: (visibility changed, shape changed).
+    cursor_news: (bool, bool),
     shape_buf: Vec<u8>,
 }
 
@@ -113,8 +118,10 @@ impl Duplicator {
                 height: desc.ModeDesc.Height,
                 have_frame: false,
                 cursor: None,
+                cursor_hotspot: (0, 0),
                 cursor_pos: (0, 0),
                 cursor_visible: false,
+                cursor_news: (false, false),
                 shape_buf: Vec::new(),
             })
         }
@@ -144,6 +151,9 @@ impl Duplicator {
             let vis = info.PointerPosition.Visible.as_bool();
             let pos = (info.PointerPosition.Position.x, info.PointerPosition.Position.y);
             changed |= vis != self.cursor_visible || (vis && pos != self.cursor_pos);
+            if vis != self.cursor_visible {
+                self.cursor_news.0 = true;
+            }
             self.cursor_visible = vis;
             self.cursor_pos = pos;
         }
@@ -166,6 +176,11 @@ impl Duplicator {
                 si.Pitch as usize,
                 &self.shape_buf,
             );
+            self.cursor_hotspot = (si.HotSpot.x, si.HotSpot.y);
+            self.cursor_news.1 = true;
+            if self.cursor.is_none() {
+                log::warn!("unsupported pointer shape type {} ({}x{})", si.Type, si.Width, si.Height);
+            }
             changed = true;
         }
         if info.LastPresentTime != 0
@@ -209,7 +224,33 @@ impl Duplicator {
     }
 }
 
-pub fn capture_thread(sh: Arc<CaptureShared>, scale: usize, out: (u32, u32), ready: Sender<Result<()>>) {
+/// Tells the viewer about pointer visibility/shape changes.
+fn report_cursor(dup: &mut Duplicator, sink: &SharedSink) {
+    let (vis_changed, shape_changed) = std::mem::take(&mut dup.cursor_news);
+    if !vis_changed && !shape_changed {
+        return;
+    }
+    let shape = if shape_changed {
+        dup.cursor.as_ref().filter(|c| c.w <= 256 && c.h <= 256).map(|c| CursorShape {
+            w: c.w as u16,
+            h: c.h as u16,
+            hot_x: dup.cursor_hotspot.0.clamp(0, c.w as i32 - 1) as u16,
+            hot_y: dup.cursor_hotspot.1.clamp(0, c.h as i32 - 1) as u16,
+            rgba: convert::cursor_to_rgba(c),
+        })
+    } else {
+        None
+    };
+    sink.cursor(dup.cursor_visible, shape.as_ref());
+}
+
+pub fn capture_thread(
+    sh: Arc<CaptureShared>,
+    sink: SharedSink,
+    scale: usize,
+    out: (u32, u32),
+    ready: Sender<Result<()>>,
+) {
     super::com_init();
     let mut ready = Some(ready);
     let mut pool: Vec<Arc<RawFrame>> = Vec::new();
@@ -252,9 +293,12 @@ pub fn capture_thread(sh: Arc<CaptureShared>, scale: usize, out: (u32, u32), rea
             if sh.stop.load(Ordering::Relaxed) {
                 return;
             }
-            match dup.next(100) {
-                Ok(false) => continue,
-                Ok(true) => {
+            let next = dup.next(100);
+            report_cursor(&mut dup, &sink);
+            let redraw = sh.redraw.swap(false, Ordering::AcqRel) && dup.have_frame;
+            match next {
+                Ok(false) if !redraw => continue,
+                Ok(_) => {
                     let idx = match pool.iter().position(|f| Arc::strong_count(f) == 1) {
                         Some(i) => i,
                         None if pool.len() < 4 => {
@@ -269,7 +313,7 @@ pub fn capture_thread(sh: Arc<CaptureShared>, scale: usize, out: (u32, u32), rea
                         None => continue, // encoder is behind; skip this frame
                     };
                     let frame = Arc::get_mut(&mut pool[idx]).expect("unshared frame");
-                    let cursor = if dup.cursor_visible {
+                    let cursor = if dup.cursor_visible && sh.cursor_in_video.load(Ordering::Relaxed) {
                         dup.cursor.as_ref().map(|c| (c, dup.cursor_pos.0, dup.cursor_pos.1))
                     } else {
                         None

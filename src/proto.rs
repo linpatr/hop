@@ -3,11 +3,29 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const DISCOVERY_PORT: u16 = 47120;
-pub const CONTROL_PORT: u16 = 47121;
-pub const MEDIA_PORT: u16 = 47122;
+const DISCOVERY_PORT: u16 = 47120;
+const CONTROL_PORT: u16 = 47121;
+const MEDIA_PORT: u16 = 47122;
 pub const INSTALL_PORT: u16 = 47123;
-pub const PROTOCOL_VERSION: u32 = 1;
+
+/// HOP_PORT_OFFSET shifts every port, so a test copy can run beside the real one.
+fn port_offset() -> u16 {
+    static OFFSET: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| std::env::var("HOP_PORT_OFFSET").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+pub fn discovery_port() -> u16 {
+    DISCOVERY_PORT + port_offset()
+}
+
+pub fn control_port() -> u16 {
+    CONTROL_PORT + port_offset()
+}
+
+pub fn media_port() -> u16 {
+    MEDIA_PORT + port_offset()
+}
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Plaintext hello exchanged before the key exchange.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -47,7 +65,28 @@ pub enum Ctrl {
     Ping { ts: u64 },
     Pong { ts: u64 },
     Clipboard { text: String },
+    /// Client -> host: `local` = the viewer draws the mouse pointer itself (desktop use), so the
+    /// host leaves it out of the video and sends pointer shapes instead. Off while the mouse is
+    /// locked for games.
+    CursorMode { local: bool },
     Bye,
+}
+
+/// A mouse pointer image (straight-alpha RGBA) and its hotspot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorShape {
+    pub w: u16,
+    pub h: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub rgba: Vec<u8>,
+}
+
+/// Host -> client pointer update: visibility, plus the new shape when it changed.
+#[derive(Clone, Debug)]
+pub struct CursorMsg {
+    pub visible: bool,
+    pub shape: Option<CursorShape>,
 }
 
 /// Input events, client -> host. Key codes are USB HID usages (keyboard page 0x07).
@@ -66,6 +105,32 @@ pub enum Input {
 
 pub const MSG_CTRL: u8 = 0;
 pub const MSG_INPUT: u8 = 1;
+pub const MSG_CURSOR: u8 = 2;
+
+pub fn encode_cursor(visible: bool, shape: Option<&CursorShape>) -> Vec<u8> {
+    let mut v = vec![MSG_CURSOR, visible as u8];
+    if let Some(c) = shape {
+        for x in [c.w, c.h, c.hot_x, c.hot_y] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v.extend_from_slice(&c.rgba);
+    }
+    v
+}
+
+fn decode_cursor(b: &[u8]) -> Result<CursorMsg> {
+    let Some(&vis) = b.first() else { bail!("short cursor message") };
+    if b.len() < 9 {
+        return Ok(CursorMsg { visible: vis != 0, shape: None });
+    }
+    let u = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let (w, h) = (u(1), u(3));
+    let rgba = b[9..].to_vec();
+    if rgba.len() != w as usize * h as usize * 4 || w == 0 || h == 0 {
+        bail!("bad cursor image");
+    }
+    Ok(CursorMsg { visible: vis != 0, shape: Some(CursorShape { w, h, hot_x: u(5), hot_y: u(7), rgba }) })
+}
 
 pub fn encode_ctrl(c: &Ctrl) -> Vec<u8> {
     let mut v = vec![MSG_CTRL];
@@ -111,6 +176,7 @@ pub fn encode_input(i: &Input) -> Vec<u8> {
 pub enum Message {
     Ctrl(Ctrl),
     Input(Input),
+    Cursor(CursorMsg),
 }
 
 pub fn decode_message(b: &[u8]) -> Result<Message> {
@@ -118,6 +184,7 @@ pub fn decode_message(b: &[u8]) -> Result<Message> {
     match kind {
         MSG_CTRL => Ok(Message::Ctrl(serde_json::from_slice(rest)?)),
         MSG_INPUT => Ok(Message::Input(decode_input(rest)?)),
+        MSG_CURSOR => Ok(Message::Cursor(decode_cursor(rest)?)),
         _ => bail!("unknown message kind {kind}"),
     }
 }
@@ -154,6 +221,22 @@ pub fn os_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_roundtrip() {
+        let shape = CursorShape { w: 2, h: 3, hot_x: 1, hot_y: 2, rgba: (0..24).collect() };
+        match decode_message(&encode_cursor(true, Some(&shape))).unwrap() {
+            Message::Cursor(c) => {
+                assert!(c.visible);
+                assert_eq!(c.shape, Some(shape));
+            }
+            _ => panic!(),
+        }
+        match decode_message(&encode_cursor(false, None)).unwrap() {
+            Message::Cursor(c) => assert!(!c.visible && c.shape.is_none()),
+            _ => panic!(),
+        }
+    }
 
     #[test]
     fn input_roundtrip() {
