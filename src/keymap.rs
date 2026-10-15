@@ -1,0 +1,349 @@
+//! Key code translation. On the wire every key is a USB HID usage (keyboard page 0x07), which
+//! keeps the mapping physical: the key in the same place on the keyboard is pressed on the host.
+
+use winit::keyboard::KeyCode;
+
+/// (HID usage, Windows set-1 scancode with 0xE000 for extended keys, macOS virtual key code)
+/// 0xFFFF = no equivalent.
+const TABLE: &[(u16, u16, u16)] = &[
+    (0x04, 0x1E, 0x00), // A
+    (0x05, 0x30, 0x0B), // B
+    (0x06, 0x2E, 0x08), // C
+    (0x07, 0x20, 0x02), // D
+    (0x08, 0x12, 0x0E), // E
+    (0x09, 0x21, 0x03), // F
+    (0x0A, 0x22, 0x05), // G
+    (0x0B, 0x23, 0x04), // H
+    (0x0C, 0x17, 0x22), // I
+    (0x0D, 0x24, 0x26), // J
+    (0x0E, 0x25, 0x28), // K
+    (0x0F, 0x26, 0x25), // L
+    (0x10, 0x32, 0x2E), // M
+    (0x11, 0x31, 0x2D), // N
+    (0x12, 0x18, 0x1F), // O
+    (0x13, 0x19, 0x23), // P
+    (0x14, 0x10, 0x0C), // Q
+    (0x15, 0x13, 0x0F), // R
+    (0x16, 0x1F, 0x01), // S
+    (0x17, 0x14, 0x11), // T
+    (0x18, 0x16, 0x20), // U
+    (0x19, 0x2F, 0x09), // V
+    (0x1A, 0x11, 0x0D), // W
+    (0x1B, 0x2D, 0x07), // X
+    (0x1C, 0x15, 0x10), // Y
+    (0x1D, 0x2C, 0x06), // Z
+    (0x1E, 0x02, 0x12), // 1
+    (0x1F, 0x03, 0x13), // 2
+    (0x20, 0x04, 0x14), // 3
+    (0x21, 0x05, 0x15), // 4
+    (0x22, 0x06, 0x17), // 5
+    (0x23, 0x07, 0x16), // 6
+    (0x24, 0x08, 0x1A), // 7
+    (0x25, 0x09, 0x1C), // 8
+    (0x26, 0x0A, 0x19), // 9
+    (0x27, 0x0B, 0x1D), // 0
+    (0x28, 0x1C, 0x24), // Enter
+    (0x29, 0x01, 0x35), // Escape
+    (0x2A, 0x0E, 0x33), // Backspace
+    (0x2B, 0x0F, 0x30), // Tab
+    (0x2C, 0x39, 0x31), // Space
+    (0x2D, 0x0C, 0x1B), // Minus
+    (0x2E, 0x0D, 0x18), // Equal
+    (0x2F, 0x1A, 0x21), // [
+    (0x30, 0x1B, 0x1E), // ]
+    (0x31, 0x2B, 0x2A), // Backslash
+    (0x33, 0x27, 0x29), // ;
+    (0x34, 0x28, 0x27), // '
+    (0x35, 0x29, 0x32), // `
+    (0x36, 0x33, 0x2B), // ,
+    (0x37, 0x34, 0x2F), // .
+    (0x38, 0x35, 0x2C), // /
+    (0x39, 0x3A, 0x39), // Caps Lock
+    (0x3A, 0x3B, 0x7A), // F1
+    (0x3B, 0x3C, 0x78), // F2
+    (0x3C, 0x3D, 0x63), // F3
+    (0x3D, 0x3E, 0x76), // F4
+    (0x3E, 0x3F, 0x60), // F5
+    (0x3F, 0x40, 0x61), // F6
+    (0x40, 0x41, 0x62), // F7
+    (0x41, 0x42, 0x64), // F8
+    (0x42, 0x43, 0x65), // F9
+    (0x43, 0x44, 0x6D), // F10
+    (0x44, 0x57, 0x67), // F11
+    (0x45, 0x58, 0x6F), // F12
+    (0x46, 0xE037, 0x69), // Print Screen (F13 on Mac)
+    (0x47, 0x46, 0x6B), // Scroll Lock (F14 on Mac)
+    (0x48, 0xE11D, 0x71), // Pause (F15 on Mac), special-cased on Windows
+    (0x49, 0xE052, 0x72), // Insert (Help on Mac)
+    (0x4A, 0xE047, 0x73), // Home
+    (0x4B, 0xE049, 0x74), // Page Up
+    (0x4C, 0xE053, 0x75), // Delete (forward)
+    (0x4D, 0xE04F, 0x77), // End
+    (0x4E, 0xE051, 0x79), // Page Down
+    (0x4F, 0xE04D, 0x7C), // Right
+    (0x50, 0xE04B, 0x7B), // Left
+    (0x51, 0xE050, 0x7D), // Down
+    (0x52, 0xE048, 0x7E), // Up
+    (0x53, 0x45, 0x47),   // Num Lock (Clear on Mac)
+    (0x54, 0xE035, 0x4B), // Keypad /
+    (0x55, 0x37, 0x43),   // Keypad *
+    (0x56, 0x4A, 0x4E),   // Keypad -
+    (0x57, 0x4E, 0x45),   // Keypad +
+    (0x58, 0xE01C, 0x4C), // Keypad Enter
+    (0x59, 0x4F, 0x53),   // Keypad 1
+    (0x5A, 0x50, 0x54),   // Keypad 2
+    (0x5B, 0x51, 0x55),   // Keypad 3
+    (0x5C, 0x4B, 0x56),   // Keypad 4
+    (0x5D, 0x4C, 0x57),   // Keypad 5
+    (0x5E, 0x4D, 0x58),   // Keypad 6
+    (0x5F, 0x47, 0x59),   // Keypad 7
+    (0x60, 0x48, 0x5B),   // Keypad 8
+    (0x61, 0x49, 0x5C),   // Keypad 9
+    (0x62, 0x52, 0x52),   // Keypad 0
+    (0x63, 0x53, 0x41),   // Keypad .
+    (0x64, 0x56, 0x0A),   // Non-US \ (ISO § key on Mac)
+    (0x65, 0xE05D, 0x6E), // Context menu
+    (0x67, 0x59, 0x51),   // Keypad =
+    (0x68, 0x64, 0x69),   // F13
+    (0x69, 0x65, 0x6B),   // F14
+    (0x6A, 0x66, 0x71),   // F15
+    (0x6B, 0x67, 0x6A),   // F16
+    (0x6C, 0x68, 0x40),   // F17
+    (0x6D, 0x69, 0x4F),   // F18
+    (0x6E, 0x6A, 0x50),   // F19
+    (0x6F, 0x6B, 0x5A),   // F20
+    (0x70, 0x6C, 0xFFFF), // F21
+    (0x71, 0x6D, 0xFFFF), // F22
+    (0x72, 0x6E, 0xFFFF), // F23
+    (0x73, 0x76, 0xFFFF), // F24
+    (0x7F, 0xE020, 0x4A), // Mute
+    (0x80, 0xE030, 0x48), // Volume Up
+    (0x81, 0xE02E, 0x49), // Volume Down
+    (0x85, 0x7E, 0x5F),   // Keypad , (JIS)
+    (0x87, 0x73, 0x5E),   // Ro / JIS underscore
+    (0x88, 0x70, 0x68),   // Kana
+    (0x89, 0x7D, 0x5D),   // Yen
+    (0x8A, 0x79, 0xFFFF), // Convert
+    (0x8B, 0x7B, 0xFFFF), // Non-convert
+    (0x90, 0xF2, 0x68),   // Lang1 (Hangul / Kana)
+    (0x91, 0xF1, 0x66),   // Lang2 (Hanja / Eisu)
+    (0xE0, 0x1D, 0x3B),   // Left Control
+    (0xE1, 0x2A, 0x38),   // Left Shift
+    (0xE2, 0x38, 0x3A),   // Left Alt / Option
+    (0xE3, 0xE05B, 0x37), // Left Windows / Command
+    (0xE4, 0xE01D, 0x3E), // Right Control
+    (0xE5, 0x36, 0x3C),   // Right Shift
+    (0xE6, 0xE038, 0x3D), // Right Alt / Option
+    (0xE7, 0xE05C, 0x36), // Right Windows / Command
+];
+
+pub const HID_LCTRL: u16 = 0xE0;
+pub const HID_LGUI: u16 = 0xE3;
+pub const HID_RCTRL: u16 = 0xE4;
+pub const HID_RGUI: u16 = 0xE7;
+
+/// Windows scancode (0xE0xx for extended keys) -> HID.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_scancode_to_hid(sc: u16) -> Option<u16> {
+    TABLE.iter().find(|e| e.1 == sc).map(|e| e.0)
+}
+
+/// macOS virtual key -> HID.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn mac_vk_to_hid(vk: u16) -> Option<u16> {
+    TABLE.iter().find(|e| e.2 == vk).map(|e| e.0)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn hid_to_windows_scancode(hid: u16) -> Option<u16> {
+    TABLE.iter().find(|e| e.0 == hid).map(|e| e.1)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn hid_to_mac_vk(hid: u16) -> Option<u16> {
+    TABLE.iter().find(|e| e.0 == hid).map(|e| e.2).filter(|&v| v != 0xFFFF)
+}
+
+/// Swaps Control and Command/Windows, for people who want Cmd+C on a Mac keyboard to be Ctrl+C on
+/// Windows (and the other way round).
+pub fn swap_ctrl_meta(hid: u16) -> u16 {
+    match hid {
+        HID_LCTRL => HID_LGUI,
+        HID_LGUI => HID_LCTRL,
+        HID_RCTRL => HID_RGUI,
+        HID_RGUI => HID_RCTRL,
+        h => h,
+    }
+}
+
+pub fn keycode_to_hid(k: KeyCode) -> Option<u16> {
+    use KeyCode::*;
+    Some(match k {
+        KeyA => 0x04,
+        KeyB => 0x05,
+        KeyC => 0x06,
+        KeyD => 0x07,
+        KeyE => 0x08,
+        KeyF => 0x09,
+        KeyG => 0x0A,
+        KeyH => 0x0B,
+        KeyI => 0x0C,
+        KeyJ => 0x0D,
+        KeyK => 0x0E,
+        KeyL => 0x0F,
+        KeyM => 0x10,
+        KeyN => 0x11,
+        KeyO => 0x12,
+        KeyP => 0x13,
+        KeyQ => 0x14,
+        KeyR => 0x15,
+        KeyS => 0x16,
+        KeyT => 0x17,
+        KeyU => 0x18,
+        KeyV => 0x19,
+        KeyW => 0x1A,
+        KeyX => 0x1B,
+        KeyY => 0x1C,
+        KeyZ => 0x1D,
+        Digit1 => 0x1E,
+        Digit2 => 0x1F,
+        Digit3 => 0x20,
+        Digit4 => 0x21,
+        Digit5 => 0x22,
+        Digit6 => 0x23,
+        Digit7 => 0x24,
+        Digit8 => 0x25,
+        Digit9 => 0x26,
+        Digit0 => 0x27,
+        Enter => 0x28,
+        Escape => 0x29,
+        Backspace => 0x2A,
+        Tab => 0x2B,
+        Space => 0x2C,
+        Minus => 0x2D,
+        Equal => 0x2E,
+        BracketLeft => 0x2F,
+        BracketRight => 0x30,
+        Backslash => 0x31,
+        Semicolon => 0x33,
+        Quote => 0x34,
+        Backquote => 0x35,
+        Comma => 0x36,
+        Period => 0x37,
+        Slash => 0x38,
+        CapsLock => 0x39,
+        F1 => 0x3A,
+        F2 => 0x3B,
+        F3 => 0x3C,
+        F4 => 0x3D,
+        F5 => 0x3E,
+        F6 => 0x3F,
+        F7 => 0x40,
+        F8 => 0x41,
+        F9 => 0x42,
+        F10 => 0x43,
+        F11 => 0x44,
+        F12 => 0x45,
+        PrintScreen => 0x46,
+        ScrollLock => 0x47,
+        Pause => 0x48,
+        Insert => 0x49,
+        Help => 0x49,
+        Home => 0x4A,
+        PageUp => 0x4B,
+        Delete => 0x4C,
+        End => 0x4D,
+        PageDown => 0x4E,
+        ArrowRight => 0x4F,
+        ArrowLeft => 0x50,
+        ArrowDown => 0x51,
+        ArrowUp => 0x52,
+        NumLock => 0x53,
+        NumpadDivide => 0x54,
+        NumpadMultiply => 0x55,
+        NumpadSubtract => 0x56,
+        NumpadAdd => 0x57,
+        NumpadEnter => 0x58,
+        Numpad1 => 0x59,
+        Numpad2 => 0x5A,
+        Numpad3 => 0x5B,
+        Numpad4 => 0x5C,
+        Numpad5 => 0x5D,
+        Numpad6 => 0x5E,
+        Numpad7 => 0x5F,
+        Numpad8 => 0x60,
+        Numpad9 => 0x61,
+        Numpad0 => 0x62,
+        NumpadDecimal => 0x63,
+        IntlBackslash => 0x64,
+        ContextMenu => 0x65,
+        NumpadEqual => 0x67,
+        F13 => 0x68,
+        F14 => 0x69,
+        F15 => 0x6A,
+        F16 => 0x6B,
+        F17 => 0x6C,
+        F18 => 0x6D,
+        F19 => 0x6E,
+        F20 => 0x6F,
+        F21 => 0x70,
+        F22 => 0x71,
+        F23 => 0x72,
+        F24 => 0x73,
+        AudioVolumeMute => 0x7F,
+        AudioVolumeUp => 0x80,
+        AudioVolumeDown => 0x81,
+        NumpadComma => 0x85,
+        IntlRo => 0x87,
+        KanaMode => 0x88,
+        IntlYen => 0x89,
+        Convert => 0x8A,
+        NonConvert => 0x8B,
+        Lang1 => 0x90,
+        Lang2 => 0x91,
+        ControlLeft => 0xE0,
+        ShiftLeft => 0xE1,
+        AltLeft => 0xE2,
+        SuperLeft => 0xE3,
+        ControlRight => 0xE4,
+        ShiftRight => 0xE5,
+        AltRight => 0xE6,
+        SuperRight => 0xE7,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_has_no_duplicate_hids() {
+        let mut seen = std::collections::HashSet::new();
+        for e in TABLE {
+            assert!(seen.insert(e.0), "duplicate hid {:#x}", e.0);
+        }
+    }
+
+    #[test]
+    fn letters_map_everywhere() {
+        for hid in 0x04..=0x1D {
+            assert!(hid_to_mac_vk(hid).is_some());
+            assert!(hid_to_windows_scancode(hid).is_some());
+        }
+        assert_eq!(hid_to_mac_vk(keycode_to_hid(KeyCode::KeyC).unwrap()), Some(0x08));
+        assert_eq!(hid_to_windows_scancode(keycode_to_hid(KeyCode::SuperLeft).unwrap()), Some(0xE05B));
+    }
+
+    #[test]
+    fn reverse_lookups() {
+        for hid in (0x04..=0x45).chain(0xE0..=0xE7) {
+            if let Some(vk) = hid_to_mac_vk(hid) {
+                assert_eq!(mac_vk_to_hid(vk), Some(hid), "mac vk {vk:#x}");
+            }
+            if let Some(sc) = hid_to_windows_scancode(hid) {
+                assert_eq!(windows_scancode_to_hid(sc), Some(hid), "scancode {sc:#x}");
+            }
+        }
+    }
+}

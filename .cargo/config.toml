@@ -1,0 +1,6 @@
+[build]
+# Build output lives on the external SSD (internal drive is tight on space).
+target-dir = "/Volumes/9100PRO/Developer/Cargo/hop-target"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

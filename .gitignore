@@ -1,0 +1,5 @@
+/target
+/dist
+*.ppm
+.DS_Store
+assets/AppIcon.iconset/
