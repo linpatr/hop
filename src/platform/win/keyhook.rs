@@ -17,6 +17,12 @@ use crate::keymap;
 pub type KeyGrabFn = Box<dyn Fn(u16, bool, bool) + Send + Sync>;
 
 static CALLBACK: OnceLock<KeyGrabFn> = OnceLock::new();
+/// Only capture while a remote screen is showing.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_key_grab(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 static DOWN: std::sync::Mutex<[bool; 256]> = std::sync::Mutex::new([false; 256]);
 
 fn we_are_in_front() -> bool {
@@ -28,7 +34,7 @@ fn we_are_in_front() -> bool {
 }
 
 unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && we_are_in_front() {
+    if code == HC_ACTION as i32 && ENABLED.load(std::sync::atomic::Ordering::Relaxed) && we_are_in_front() {
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         if kb.flags.0 & LLKHF_INJECTED.0 == 0
             && let Some(cb) = CALLBACK.get()

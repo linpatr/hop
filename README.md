@@ -21,7 +21,9 @@ The one-liners download Hop.exe and open it. Then click **Install Hop**: it copi
 
 **Windows Defender says "Trojan:Win32/Bearfoos"?** That's Defender's machine-learning guess (detections ending in `!ml`). It often flags new programs that aren't code-signed, especially remote-control tools, because they capture the screen and send keystrokes the way the real thing does. Hop is built from this source code. To use it anyway, restore it in Windows Security → Protection history ("Allow on device"). Microsoft clears false positives submitted at https://www.microsoft.com/en-us/wdsi/filesubmission (as "Software developer", "Incorrect detection").
 
-Then, on either computer, click **Connect** next to the other one. The first time, type the access code shown on the other computer. It's remembered after that.
+Then, on either computer, click **Connect** next to the other one. The first time, type the access code shown on the other computer. It's remembered after that. The Hop window turns into the other computer's screen; disconnecting (Ctrl+Alt+Shift+Q, or closing the window) brings the Hop window back.
+
+To watch on a particular monitor (say, the second display of a Mac), open **Stream settings → When connected** and pick **Fullscreen on** that display. Ctrl+Alt+Shift+F toggles fullscreen on whichever display the window is on.
 
 - The Hop window shows who's connected to this computer, with a **Disconnect** button. The window flashes when someone connects.
 - **Rename** sets the name your other computers see.

@@ -821,7 +821,8 @@ final class KeyTap {
     let cb: HopKeyCB
     var tap: CFMachPort?
     var source: CFRunLoopSource?
-    var enabled = true
+    // Off until the app turns it on (only while a remote screen is showing).
+    var enabled = false
 
     init(ctx: UnsafeMutableRawPointer?, cb: @escaping HopKeyCB) { self.ctx = ctx; self.cb = cb }
 
@@ -898,17 +899,6 @@ public func hop_mac_keytap_enable(_ on: Int32) {
 }
 
 // MARK: - Window activation
-
-/// Lets another process (the viewer we just launched) bring its window to the front.
-/// macOS 14+ only activates apps that the active app yields to.
-@_cdecl("hop_mac_yield_activation")
-public func hop_mac_yield_activation(_ pid: Int32) -> Int32 {
-    guard let app = NSRunningApplication(processIdentifier: pid) else { return 0 }
-    if #available(macOS 14.0, *) {
-        NSApp.yieldActivation(to: app)
-    }
-    return 1
-}
 
 @_cdecl("hop_mac_activate_self")
 public func hop_mac_activate_self() {

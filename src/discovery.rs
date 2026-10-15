@@ -145,6 +145,18 @@ impl Browser {
             .filter(|p| p.last_seen.elapsed() < Duration::from_secs(5))
             .cloned()
             .collect();
+        // HOP_PREVIEW_PEERS="Name|os|ip;...": made-up computers, for rendering previews.
+        if let Ok(fake) = std::env::var("HOP_PREVIEW_PEERS") {
+            for (i, entry) in fake.split(';').enumerate() {
+                let f: Vec<&str> = entry.split('|').collect();
+                if let [name, os, ip] = f[..]
+                    && let Ok(ip) = ip.parse()
+                {
+                    let beacon = Beacon { hop: PROTOCOL_VERSION, id: format!("preview{i}"), name: name.into(), os: os.into(), port: control_port() };
+                    v.push(Peer { beacon, ip, last_seen: Instant::now() });
+                }
+            }
+        }
         v.sort_by(|a, b| a.beacon.name.cmp(&b.beacon.name));
         v
     }

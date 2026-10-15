@@ -15,6 +15,8 @@ pub struct StreamPrefs {
     pub fec_percent: u32,
     pub audio: bool,
     pub fullscreen: bool,
+    /// Display to go fullscreen on ("" = the one the Hop window is on).
+    pub fullscreen_display: String,
     pub vsync: bool,
     /// Swap Ctrl and Cmd/Win when the two computers run different OSes.
     pub swap_ctrl_cmd: bool,
@@ -33,6 +35,7 @@ impl Default for StreamPrefs {
             fec_percent: 15,
             audio: true,
             fullscreen: false,
+            fullscreen_display: String::new(),
             vsync: false,
             swap_ctrl_cmd: false,
             grab_keyboard: true,
@@ -77,7 +80,11 @@ impl Default for Config {
 }
 
 pub fn dir() -> PathBuf {
-    let d = dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("Hop");
+    // HOP_CONFIG_DIR: use a separate settings folder (for testing beside the real app).
+    let d = match std::env::var_os("HOP_CONFIG_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("Hop"),
+    };
     let _ = std::fs::create_dir_all(&d);
     d
 }

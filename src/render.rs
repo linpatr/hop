@@ -256,6 +256,53 @@ impl Renderer {
         (((ww - w) / 2.0).floor(), ((wh - h) / 2.0).floor(), w.round(), h.round())
     }
 
+    /// The UI context shared by the home screen and the stream overlay.
+    pub fn egui(&self) -> &egui::Context {
+        &self.egui
+    }
+
+    /// Draws a full egui frame (the home screen) on a plain background.
+    pub fn render_ui(&mut self, mut out: egui::FullOutput, background: egui::Color32) {
+        // Texture updates (the font atlas, notably) are sent once: apply them even if this frame
+        // can't be drawn.
+        let mut textures = std::mem::take(&mut out.textures_delta);
+        self.apply_textures(&mut textures);
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            _ => return,
+        };
+        let view = frame.texture.create_view(&Default::default());
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let [r, g, b, _] = background.to_normalized_gamma_f32();
+        {
+            let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        }
+        self.paint_egui(&mut enc, &view, out);
+        self.queue.submit([enc.finish()]);
+        self.queue.present(frame);
+    }
+
+    /// Forgets the last video frame (so the next stream doesn't flash the old one).
+    pub fn clear_video(&mut self) {
+        self.video = None;
+    }
+
     pub fn render(&mut self, overlay: &Overlay, scale: f32) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -359,12 +406,28 @@ impl Renderer {
                 );
             }
         });
-        let jobs = self.egui.tessellate(out.shapes, out.pixels_per_point);
-        for (id, deltas) in &out.textures_delta.set {
+        self.paint_egui(enc, view, out);
+    }
+
+    /// Draws an egui frame on top of whatever is in `view`.
+    /// Uploads new egui textures and frees old ones.
+    fn apply_textures(&mut self, textures: &mut egui::TexturesDelta) {
+        for (id, deltas) in &textures.set {
             for delta in deltas {
                 self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
             }
         }
+        for id in &textures.free {
+            self.egui_renderer.free_texture(id);
+        }
+        textures.clear();
+    }
+
+    fn paint_egui(&mut self, enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, mut out: egui::FullOutput) {
+        let (w, h) = (self.config.width, self.config.height);
+        let mut textures = std::mem::take(&mut out.textures_delta);
+        self.apply_textures(&mut textures);
+        let jobs = self.egui.tessellate(out.shapes, out.pixels_per_point);
         let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: out.pixels_per_point };
         self.egui_renderer.update_buffers(&self.device, &self.queue, enc, &jobs, &sd);
         {
@@ -382,9 +445,6 @@ impl Renderer {
                 .forget_lifetime();
             self.egui_renderer.render(&mut pass, &jobs, &sd);
         }
-        for id in &out.textures_delta.free {
-            self.egui_renderer.free_texture(id);
-        }
     }
 }
 
@@ -392,4 +452,113 @@ fn pick_present_mode(modes: &[wgpu::PresentMode], vsync: bool) -> wgpu::PresentM
     use wgpu::PresentMode::*;
     let prefs: &[wgpu::PresentMode] = if vsync { &[Fifo] } else { &[Immediate, Mailbox, Fifo] };
     prefs.iter().copied().find(|m| modes.contains(m)).unwrap_or(Fifo)
+}
+
+/// Draws a UI into a PNG without a window (for checking the design).
+pub fn render_offscreen(
+    size: (f32, f32),
+    scale: f32,
+    dark: bool,
+    mut ui_fn: impl FnMut(&mut egui::Ui),
+    path: &std::path::Path,
+) -> Result<()> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::default(),
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .context("no GPU adapter")?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).context("create device")?;
+    let (w, h) = ((size.0 * scale) as u32, (size.1 * scale) as u32);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+    let mut er = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+    let mut last = None;
+    // A few passes so layout and fonts settle.
+    for _ in 0..4 {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size.0, size.1))),
+            ..Default::default()
+        };
+        if let Some(v) = raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+            v.native_pixels_per_point = Some(scale);
+        }
+        let mut out = ctx.run_ui(raw, |ui| ui_fn(ui));
+        for (id, deltas) in &out.textures_delta.set {
+            for d in deltas {
+                er.update_texture(&device, &queue, *id, d);
+            }
+        }
+        for id in &out.textures_delta.free {
+            er.free_texture(id);
+        }
+        out.textures_delta.clear();
+        last = Some(out);
+    }
+    let out = last.unwrap();
+    let jobs = ctx.tessellate(out.shapes, out.pixels_per_point);
+    let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: out.pixels_per_point };
+    let mut enc = device.create_command_encoder(&Default::default());
+    er.update_buffers(&device, &queue, &mut enc, &jobs, &sd);
+    let [r, g, b, _] = crate::theme::background(&ctx).to_normalized_gamma_f32();
+    {
+        let mut pass = enc
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            })
+            .forget_lifetime();
+        er.render(&mut pass, &jobs, &sd);
+    }
+    let bpr = (w * 4).div_ceil(256) * 256;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (bpr * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range().map_err(|e| anyhow::anyhow!("map: {e:?}"))?;
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h {
+        let s = (row * bpr) as usize;
+        rgba.extend_from_slice(&data[s..s + (w * 4) as usize]);
+    }
+    image::save_buffer(path, &rgba, w, h, image::ExtendedColorType::Rgba8).context("write png")?;
+    Ok(())
 }

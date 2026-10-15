@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app;
 mod audio;
 mod autostart;
 mod client;
@@ -11,13 +12,14 @@ mod discovery;
 mod host;
 mod install;
 mod keymap;
-mod launcher;
+mod home;
 mod logging;
 mod media;
 mod platform;
 mod proto;
 mod render;
 mod selftest;
+mod theme;
 mod window;
 
 use std::sync::Arc;
@@ -55,6 +57,24 @@ fn main() {
         }
         // Run by the installer with admin rights (one Windows prompt naming Hop).
         Some("admin-firewall") => install::admin_firewall(args.get(1).map(String::as_str).unwrap_or_default()),
+        // Development: draw the home screen into a PNG (use HOP_CONFIG_DIR for made-up data).
+        Some("render-home") => {
+            logging::init("hop-render.log");
+            let out = args.get(1).cloned().unwrap_or_else(|| "home.png".into());
+            let dark = !args.iter().any(|a| a == "--light");
+            let mut home = home::Home::new();
+            home.displays = vec!["Built-in Display".into(), "LG UltraFine".into()];
+            let height = if std::env::var_os("HOP_PREVIEW_OPEN").is_some() { 1500.0 } else { 900.0 };
+            let r = render::render_offscreen((540.0, height), 2.0, dark, |ui| home.ui(ui), std::path::Path::new(&out));
+            home.shutdown();
+            match r {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    1
+                }
+            }
+        }
         Some("selftest") => {
             logging::init("hop-selftest.log");
             selftest::run()
@@ -69,7 +89,7 @@ fn main() {
         }
         _ => {
             logging::init("hop.log");
-            launcher::run()
+            app::run()
         }
     };
     std::process::exit(code);
@@ -136,7 +156,13 @@ fn run_connect(args: &[String]) -> i32 {
         .or_else(|| cfg.known_hosts.values().find(|h| h.addr == addr || h.addr.starts_with(&format!("{addr}:"))).map(|h| h.code.clone()))
         .unwrap_or_default();
     cfg.stream = p.clone();
-    let settings = window::StreamSettings {
+    window::run(stream_settings_from(&cfg, addr, code, view_only))
+}
+
+/// Stream settings from the saved preferences.
+pub(crate) fn stream_settings_from(cfg: &Config, addr: String, code: String, view_only: bool) -> window::StreamSettings {
+    let p = &cfg.stream;
+    window::StreamSettings {
         connect: client::ConnectOptions {
             addr,
             code,
@@ -151,11 +177,11 @@ fn run_connect(args: &[String]) -> i32 {
             clipboard: p.clipboard && !view_only,
         },
         fullscreen: p.fullscreen,
+        fullscreen_display: p.fullscreen_display.clone(),
         vsync: p.vsync,
         swap_ctrl_cmd: p.swap_ctrl_cmd,
         max_height_pref: p.max_height,
         view_only,
         grab_keyboard: p.grab_keyboard && !view_only,
-    };
-    window::run(settings)
+    }
 }

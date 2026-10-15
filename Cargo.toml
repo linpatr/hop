@@ -1,6 +1,6 @@
 [package]
 name = "hop"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -29,6 +29,8 @@ if-addrs = "0.15.0"
 winit = "0.30"
 wgpu = "30"
 arboard = { version = "3.6.1", default-features = false }
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }

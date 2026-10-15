@@ -50,13 +50,8 @@ unsafe extern "C" {
     fn hop_mac_prevent_sleep(on: i32);
     fn hop_mac_wake_display();
     fn hop_mac_keytap_start(ctx: *mut c_void, cb: KeyCb) -> i32;
-    fn hop_mac_yield_activation(pid: i32) -> i32;
+    fn hop_mac_keytap_enable(on: i32);
     fn hop_mac_activate_self();
-}
-
-/// Lets the viewer process take focus (macOS 14+ cooperative activation). False until it has started.
-pub fn yield_activation(pid: u32) -> bool {
-    unsafe { hop_mac_yield_activation(pid as i32) != 0 }
 }
 
 pub fn activate_self() {
@@ -71,6 +66,11 @@ extern "C" fn key_cb(ctx: *mut c_void, vk: u16, down: i32, rep: i32) {
     if let Some(hid) = keymap::mac_vk_to_hid(vk) {
         f(hid, down != 0, rep != 0);
     }
+}
+
+/// Turns the shortcut capture on (while a remote screen is in front) or off.
+pub fn set_key_grab(on: bool) {
+    unsafe { hop_mac_keytap_enable(on as i32) }
 }
 
 /// Captures system shortcuts (Cmd+Tab, Cmd+Space, ...) for the remote computer. Returns false

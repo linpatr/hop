@@ -26,7 +26,7 @@ use super::{CaptureConfig, Capturer, Injector, SharedSink, VideoDecoder};
 use crate::convert;
 
 pub use input::WinInjector;
-pub use keyhook::start_key_grab;
+pub use keyhook::{set_key_grab, start_key_grab};
 
 static START: OnceLock<Instant> = OnceLock::new();
 
