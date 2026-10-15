@@ -23,7 +23,7 @@ The one-liners download Hop.exe and open it. Then click **Install Hop**: it copi
 
 Then, on either computer, click **Connect** next to the other one. The first time, type the access code shown on the other computer. It's remembered after that. The Hop window turns into the other computer's screen; disconnecting (Ctrl+Alt+Shift+Q, or closing the window) brings the Hop window back.
 
-Games that look around with the mouse hide the pointer; when that happens Hop captures your mouse and sends raw movement, so the camera keeps turning instead of the pointer stopping at the screen edge. When the pointer comes back (menus, inventory) Hop lets go. Ctrl+Alt+Shift+M releases or locks it by hand.
+Games that look around with the mouse hide the pointer; when that happens Hop captures your mouse and sends raw movement, so the camera keeps turning instead of the pointer stopping at the screen edge. When the pointer comes back (menus, inventory) Hop lets go. To take the mouse back yourself, hold Esc for a second (the game still gets the Esc) or press Ctrl+Alt+Shift+M; click the game to hand it back. Hop also lets go whenever the connection drops or you switch to another app.
 
 To watch on a particular monitor (say, the second display of a Mac), open **Stream settings → When connected** and pick **Fullscreen on** that display. Ctrl+Alt+Shift+F toggles fullscreen on whichever display the window is on.
 

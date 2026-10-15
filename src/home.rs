@@ -789,6 +789,9 @@ impl Home {
                         ui.label(what);
                         ui.end_row();
                     }
+                    ui.label(RichText::new("Hold Esc").monospace());
+                    ui.label("release a captured mouse");
+                    ui.end_row();
                 });
             });
             if let Some(url) = &self.install_url {
@@ -877,8 +880,8 @@ impl Home {
         changed |= theme::toggle_row(ui, &mut s.audio, "Play the other computer's sound", None);
         changed |= theme::toggle_row(ui, &mut s.clipboard, "Share copied text both ways", None);
         changed |= theme::toggle_row(ui, &mut s.grab_keyboard, "Send Cmd+Tab / Win key / Alt+Tab across", None);
-        let release = format!("For games that look around with the mouse. {}+M releases it.", crate::window::shortcut_prefix());
-        changed |= theme::toggle_row(ui, &mut s.auto_mouse_lock, "Capture the mouse when a game hides the pointer", Some(&release));
+        let release = "For games that look around with the mouse. Hold Esc to release it.";
+        changed |= theme::toggle_row(ui, &mut s.auto_mouse_lock, "Capture the mouse when a game hides the pointer", Some(release));
         changed |= theme::toggle_row(
             ui,
             &mut s.swap_ctrl_cmd,

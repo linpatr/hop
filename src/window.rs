@@ -77,6 +77,9 @@ pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_WRONG_CODE: i32 = 2;
 
 const RECONNECT_FOR: Duration = Duration::from_secs(30);
+/// Holding Escape this long releases a captured mouse.
+const ESC_HOLD: Duration = Duration::from_millis(1000);
+const HID_ESCAPE: u16 = 0x29;
 
 pub fn shortcut_prefix() -> &'static str {
     if cfg!(target_os = "macos") { "Ctrl+Option+Shift" } else { "Ctrl+Alt+Shift" }
@@ -126,6 +129,12 @@ pub struct StreamView {
     /// The host's pointer is showing (games and video players hide it). Hosts count a pointer
     /// Windows suppresses for lack of a mouse as visible, so "hidden" means an app hid it.
     remote_cursor_visible: bool,
+    /// When Escape went down while the mouse was captured (holding it releases the mouse).
+    esc_down: Option<Instant>,
+    /// The click that re-captured the mouse: its release isn't sent either.
+    swallowed_button: Option<u8>,
+    /// "Hold Esc to release" has been shown this session.
+    capture_hint_shown: bool,
     /// Pointer images from the host, by content hash.
     cursors: std::collections::HashMap<u64, CustomCursor>,
     show_stats: bool,
@@ -167,6 +176,9 @@ impl StreamView {
             auto_suppressed: false,
             pending_lock: None,
             remote_cursor_visible: true,
+            esc_down: None,
+            swallowed_button: None,
+            capture_hint_shown: false,
             cursors: Default::default(),
             show_stats: false,
             toast: None,
@@ -230,7 +242,9 @@ impl StreamView {
         if self.mouse_locked {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             self.mouse_locked = false;
+            log::info!("mouse released (session ended)");
         }
+        self.esc_down = None;
         window.set_cursor(winit::window::CursorIcon::Default);
         window.set_cursor_visible(true);
     }
@@ -240,12 +254,21 @@ impl StreamView {
         self.dirty = true;
     }
 
-    fn start_reconnect(&mut self, reason: String) {
+    fn start_reconnect(&mut self, window: &Window, reason: String) {
         log::info!("{reason}; reconnecting");
         self.session = None;
         self.pressed.clear();
         self.local_down.clear();
         self.hotkey_keys.clear();
+        // Nothing to control meanwhile, so give the mouse back. The new connection reports the
+        // pointer afresh and captures it again if a game still hides it.
+        if self.mouse_locked {
+            self.set_mouse_lock_ex(window, false, true, "connection lost");
+        }
+        self.pending_lock = None;
+        self.auto_suppressed = false;
+        self.remote_cursor_visible = true;
+        self.update_cursor_visibility(window);
         self.reconnecting = Some(Instant::now());
         let opts = self.settings.connect.clone();
         let proxy = self.proxy.clone();
@@ -291,15 +314,15 @@ impl StreamView {
         self.send(Input::ReleaseAll);
     }
 
-    fn set_mouse_lock(&mut self, window: &Window, on: bool) {
-        self.set_mouse_lock_ex(window, on, false);
-    }
-
-    fn set_mouse_lock_ex(&mut self, window: &Window, on: bool, auto: bool) {
+    /// Captures or releases the mouse. `auto`: done for a game (released again when its pointer
+    /// shows), and quietly when releasing. `why` goes in the log.
+    fn set_mouse_lock_ex(&mut self, window: &Window, on: bool, auto: bool, why: &str) {
         self.pending_lock = None;
+        self.esc_down = None;
         if !on {
             self.auto_locked = false;
         }
+        let was = self.mouse_locked;
         if on {
             let ok = window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -316,15 +339,47 @@ impl StreamView {
             s.send_ctrl(&crate::proto::Ctrl::CursorMode { local: !self.mouse_locked });
         }
         self.update_cursor_visibility(window);
+        match (was, self.mouse_locked) {
+            (false, true) => log::info!("mouse captured ({why})"),
+            (true, false) => log::info!("mouse released ({why})"),
+            (false, false) if on => log::warn!("couldn't capture the mouse ({why})"),
+            _ => {}
+        }
         if on && self.mouse_locked {
             self.auto_locked = auto;
-            let title = if auto { "Mouse captured by the game" } else { "Mouse locked to this window" };
-            self.toast(vec![title.into(), format!("{}+M to release", shortcut_prefix())], 3);
+            // Games capture and release often (menus, maps): explain the way out once.
+            if !auto || !self.capture_hint_shown {
+                self.capture_hint_shown = true;
+                let title = if auto { "Mouse captured by the game" } else { "Mouse locked to this window" };
+                self.toast(vec![title.into(), format!("Hold Esc (or {}+M) to release it", shortcut_prefix())], 5);
+            }
         } else if on {
             self.toast(vec!["Couldn't lock the mouse".into()], 3);
-        } else if !auto {
-            self.toast(vec!["Mouse released".into()], 2);
         }
+    }
+
+    /// The user took the mouse back. While the game still hides its pointer, it stays released
+    /// until they click the game (or the pointer shows and hides again).
+    fn release_mouse_by_user(&mut self, window: &Window, why: &str) {
+        if !self.remote_cursor_visible {
+            self.auto_suppressed = true;
+        }
+        self.set_mouse_lock_ex(window, false, true, why);
+        let mut lines = vec!["Mouse released".to_string()];
+        if self.auto_suppressed && self.settings.auto_mouse_lock {
+            lines.push("Click the game to capture it again".into());
+        }
+        self.toast(lines, 3);
+    }
+
+    /// A click now would hand the mouse back to a game the user released it from.
+    fn click_recaptures(&self) -> bool {
+        !self.mouse_locked
+            && self.auto_suppressed
+            && !self.remote_cursor_visible
+            && self.focused
+            && self.settings.auto_mouse_lock
+            && !self.settings.view_only
     }
 
     /// Games hide the pointer when they take over the mouse: lock it here and send raw movement
@@ -347,6 +402,12 @@ impl StreamView {
 
     /// Applies a settled automatic lock/release. Call regularly (see `next_deadline`).
     pub fn tick(&mut self, window: &Window) {
+        if self.esc_down.is_some_and(|t| t.elapsed() >= ESC_HOLD) {
+            self.esc_down = None;
+            if self.mouse_locked {
+                self.release_mouse_by_user(window, "Esc held");
+            }
+        }
         let Some((lock, at)) = self.pending_lock else { return };
         if Instant::now() < at {
             return;
@@ -354,14 +415,15 @@ impl StreamView {
         self.pending_lock = None;
         let hidden = !self.remote_cursor_visible;
         if lock && hidden && !self.mouse_locked && self.focused {
-            self.set_mouse_lock_ex(window, true, true);
+            self.set_mouse_lock_ex(window, true, true, "the game hid the pointer");
         } else if !lock && !hidden && self.mouse_locked && self.auto_locked {
-            self.set_mouse_lock_ex(window, false, true);
+            self.set_mouse_lock_ex(window, false, true, "the pointer is showing again");
         }
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending_lock.map(|(_, at)| at)
+        let esc = self.esc_down.map(|t| t + ESC_HOLD);
+        [self.pending_lock.map(|(_, at)| at), esc].into_iter().flatten().min()
     }
 
     fn update_cursor_visibility(&self, window: &Window) {
@@ -417,10 +479,14 @@ impl StreamView {
             0x09 => self.toggle_fullscreen(window),                    // F
             0x10 => {
                 // M
-                if self.mouse_locked && !self.remote_cursor_visible {
-                    self.auto_suppressed = true;
+                if self.mouse_locked {
+                    self.release_mouse_by_user(window, "shortcut");
+                } else {
+                    // While a game hides the pointer, this is an ordinary capture for it.
+                    let auto = !self.remote_cursor_visible && self.settings.auto_mouse_lock;
+                    self.auto_suppressed = false;
+                    self.set_mouse_lock_ex(window, true, auto, "shortcut");
                 }
-                self.set_mouse_lock(window, !self.mouse_locked);
             }
             0x16 => {
                 // S
@@ -437,6 +503,10 @@ impl StreamView {
             self.local_down.insert(hid);
         } else {
             self.local_down.remove(&hid);
+        }
+        // Holding Esc releases a captured mouse (see `tick`); the game still gets the key.
+        if hid == HID_ESCAPE && !repeat {
+            self.esc_down = (down && self.mouse_locked).then(Instant::now);
         }
         if down && !repeat && self.hotkey(window, hid) {
             self.hotkey_keys.insert(hid);
@@ -535,7 +605,7 @@ impl StreamView {
                 } else if reason.contains("ended the session") || reason.contains("permission") {
                     self.end = Some(StreamEnd::Failed(reason));
                 } else {
-                    self.start_reconnect(reason);
+                    self.start_reconnect(window, reason);
                 }
             }
             UserEvent::Reconnected { generation, conn } if generation == self.generation => {
@@ -565,9 +635,10 @@ impl StreamView {
                 if !f {
                     self.release_all();
                     if self.mouse_locked {
-                        self.set_mouse_lock_ex(window, false, true);
+                        self.set_mouse_lock_ex(window, false, true, "window lost focus");
                     }
                     self.pending_lock = None;
+                    self.esc_down = None;
                 } else {
                     // Back in the game: capture again if it still has the pointer hidden.
                     self.schedule_auto_lock();
@@ -595,7 +666,20 @@ impl StreamView {
                     MouseButton::Forward => 5,
                     MouseButton::Other(_) => return,
                 };
-                self.send(Input::Button { button: b, down: *state == ElementState::Pressed });
+                let down = *state == ElementState::Pressed;
+                if down && self.click_recaptures() {
+                    self.auto_suppressed = false;
+                    self.set_mouse_lock_ex(window, true, true, "clicked the game");
+                    if self.mouse_locked {
+                        self.swallowed_button = Some(b);
+                        return;
+                    }
+                }
+                if !down && self.swallowed_button == Some(b) {
+                    self.swallowed_button = None;
+                    return;
+                }
+                self.send(Input::Button { button: b, down });
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy, precise) = match delta {

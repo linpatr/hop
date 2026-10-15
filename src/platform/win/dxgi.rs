@@ -70,6 +70,9 @@ struct Duplicator {
     cursor: Option<CursorImage>,
     cursor_hotspot: (i32, i32),
     cursor_pos: (i32, i32),
+    /// Duplication says the pointer is showing on this screen (so it can be drawn into the video).
+    cursor_on_screen: bool,
+    /// What the viewer is told: false when an app (a game) hid the pointer.
     cursor_visible: bool,
     /// Pointer changes not yet reported to the viewer: (visibility changed, shape changed).
     cursor_news: (bool, bool),
@@ -122,7 +125,8 @@ impl Duplicator {
                 cursor: None,
                 cursor_hotspot: (0, 0),
                 cursor_pos: (0, 0),
-                cursor_visible: false,
+                cursor_on_screen: false,
+                cursor_visible: true,
                 cursor_news: (false, false),
                 cursor_reported: false,
                 shape_buf: Vec::new(),
@@ -151,17 +155,10 @@ impl Duplicator {
     fn process(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO, res: Option<IDXGIResource>) -> Result<bool> {
         let mut changed = false;
         if info.LastMouseUpdateTime != 0 {
-            // "Hidden" should mean an app (a game) hid it. Windows also hides the pointer when no
-            // mouse is plugged in ("suppressed"); count that as visible.
-            let vis = info.PointerPosition.Visible.as_bool() || cursor_suppressed();
+            let vis = info.PointerPosition.Visible.as_bool();
             let pos = (info.PointerPosition.Position.x, info.PointerPosition.Position.y);
-            changed |= vis != self.cursor_visible || (vis && pos != self.cursor_pos);
-            // Always report the first state, e.g. a game that hid the pointer before we connected.
-            if vis != self.cursor_visible || !self.cursor_reported {
-                self.cursor_news.0 = true;
-                self.cursor_reported = true;
-            }
-            self.cursor_visible = vis;
+            changed |= vis != self.cursor_on_screen || (vis && pos != self.cursor_pos);
+            self.cursor_on_screen = vis;
             self.cursor_pos = pos;
         }
         if info.PointerShapeBufferSize > 0 {
@@ -218,6 +215,22 @@ impl Duplicator {
         Ok(changed && self.have_frame)
     }
 
+    /// Checks whether an app hid the pointer. Asked of Windows directly every time round the
+    /// capture loop: duplication only says so when the mouse moves, and also calls a pointer that
+    /// is on another monitor hidden.
+    fn poll_cursor_visibility(&mut self) {
+        let Some(vis) = cursor_showing() else { return };
+        // Always report the first state, e.g. a game that hid the pointer before we connected.
+        if vis != self.cursor_visible || !self.cursor_reported {
+            if self.cursor_reported || !vis {
+                log::info!("{}", if vis { "pointer showing" } else { "pointer hidden by an app (a game?)" });
+            }
+            self.cursor_visible = vis;
+            self.cursor_news.0 = true;
+            self.cursor_reported = true;
+        }
+    }
+
     fn with_mapped<R>(&self, f: impl FnOnce(&[u8], usize) -> R) -> Result<R> {
         let staging = self.staging.as_ref().ok_or_else(|| anyhow!("no frame yet"))?;
         let mut m = D3D11_MAPPED_SUBRESOURCE::default();
@@ -231,10 +244,17 @@ impl Duplicator {
     }
 }
 
-fn cursor_suppressed() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SUPPRESSED, CURSORINFO, GetCursorInfo};
+/// Whether the pointer is showing, or None if Windows won't say (e.g. on the secure desktop).
+/// Games hide it with ShowCursor or an empty cursor. Windows also hides it when there's no mouse
+/// plugged in ("suppressed"); that counts as showing, since no app hid it.
+fn cursor_showing() -> Option<bool> {
+    use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSOR_SUPPRESSED, CURSORINFO, GetCursorInfo};
     let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
-    unsafe { GetCursorInfo(&mut ci).is_ok() && ci.flags.0 & CURSOR_SUPPRESSED.0 != 0 }
+    unsafe { GetCursorInfo(&mut ci) }.ok()?;
+    if ci.flags.0 & CURSOR_SUPPRESSED.0 != 0 {
+        return Some(true);
+    }
+    Some(ci.flags.0 & CURSOR_SHOWING.0 != 0 && !ci.hCursor.0.is_null())
 }
 
 /// Tells the viewer about pointer visibility/shape changes.
@@ -313,6 +333,7 @@ pub fn capture_thread(
                 return;
             }
             let next = dup.next(100);
+            dup.poll_cursor_visibility();
             report_cursor(&mut dup, &sink);
             let redraw = sh.redraw.swap(false, Ordering::AcqRel) && dup.have_frame;
             match next {
@@ -332,7 +353,7 @@ pub fn capture_thread(
                         None => continue, // encoder is behind; skip this frame
                     };
                     let frame = Arc::get_mut(&mut pool[idx]).expect("unshared frame");
-                    let cursor = if dup.cursor_visible && sh.cursor_in_video.load(Ordering::Relaxed) {
+                    let cursor = if dup.cursor_on_screen && sh.cursor_in_video.load(Ordering::Relaxed) {
                         dup.cursor.as_ref().map(|c| (c, dup.cursor_pos.0, dup.cursor_pos.1))
                     } else {
                         None

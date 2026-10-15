@@ -46,6 +46,8 @@ struct Active {
     client_addr: Mutex<Option<SocketAddr>>,
     tcp: TcpStream,
     capturer: Mutex<Option<Box<dyn Capturer>>>,
+    /// The viewer wants the pointer drawn into the video (kept for capture restarts).
+    cursor_in_video: AtomicBool,
 }
 
 impl Active {
@@ -241,6 +243,7 @@ fn handle_client(shared: &Arc<Shared>, mut s: TcpStream, peer: SocketAddr) -> Re
         client_addr: Mutex::new(None),
         tcp: s.try_clone()?,
         capturer: Mutex::new(None),
+        cursor_in_video: AtomicBool::new(true),
     });
     if let Some(old) = shared.active.lock().replace(active.clone()) {
         log::info!("replacing previous session");
@@ -338,6 +341,7 @@ fn run_session(
         }
     };
     let encoder = capturer.encoder_name();
+    capturer.set_cursor_in_video(active.cursor_in_video.load(Ordering::Relaxed));
     *active.capturer.lock() = Some(capturer);
     send_shared(writer, &Ctrl::StreamInfo { width, height, fps: cfg.fps, encoder: encoder.clone() })?;
     log::info!("streaming {width}x{height}@{} with {encoder} to {}", cfg.fps, client.name);
@@ -406,6 +410,7 @@ fn run_session(
             Message::Input(i) => injector.input(i),
             Message::Ctrl(Ctrl::CursorMode { local }) => {
                 log::info!("pointer drawn {}", if local { "by the viewer" } else { "in the video" });
+                active.cursor_in_video.store(!local, Ordering::Relaxed);
                 if let Some(c) = active.capturer.lock().as_ref() {
                     c.set_cursor_in_video(!local);
                 }
@@ -496,6 +501,7 @@ impl Supervisor {
                 match platform::start_capture(&cfg, self.sink.clone()) {
                     Ok(c) => {
                         let encoder = c.encoder_name();
+                        c.set_cursor_in_video(self.active.cursor_in_video.load(Ordering::Relaxed));
                         *self.active.capturer.lock() = Some(c);
                         log::info!("capture restarted at {width}x{height}");
                         let _ = send_shared(&self.writer, &Ctrl::StreamInfo { width, height, fps: cfg.fps, encoder });
