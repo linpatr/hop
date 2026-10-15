@@ -183,5 +183,6 @@ pub(crate) fn stream_settings_from(cfg: &Config, addr: String, code: String, vie
         max_height_pref: p.max_height,
         view_only,
         grab_keyboard: p.grab_keyboard && !view_only,
+        auto_mouse_lock: p.auto_mouse_lock,
     }
 }

@@ -46,6 +46,8 @@ pub struct StreamSettings {
     pub view_only: bool,
     /// Send system shortcuts (Cmd+Tab, Win key, Alt+Tab...) to the remote computer.
     pub grab_keyboard: bool,
+    /// Lock the mouse and send raw movement while the remote pointer is hidden (games).
+    pub auto_mouse_lock: bool,
 }
 
 impl StreamSettings {
@@ -114,11 +116,16 @@ pub struct StreamView {
     hotkey_keys: std::collections::HashSet<u16>,
     pub key_grab: bool,
     mouse_locked: bool,
-    /// The host's pointer is showing (apps like video players and games hide it).
+    /// The lock was switched on automatically because the remote pointer is hidden.
+    auto_locked: bool,
+    /// The user released an automatic lock: don't lock again until the pointer reappears.
+    auto_suppressed: bool,
+    /// An automatic lock (true) or release (false) waiting to settle, so a flickering pointer
+    /// doesn't toggle it back and forth.
+    pending_lock: Option<(bool, Instant)>,
+    /// The host's pointer is showing (games and video players hide it). Hosts count a pointer
+    /// Windows suppresses for lack of a mouse as visible, so "hidden" means an app hid it.
     remote_cursor_visible: bool,
-    /// Only trust "hidden" once the host has reported a visible pointer: Windows reports it hidden
-    /// on PCs with no mouse plugged in, and the pointer must never just vanish.
-    remote_cursor_seen: bool,
     /// Pointer images from the host, by content hash.
     cursors: std::collections::HashMap<u64, CustomCursor>,
     show_stats: bool,
@@ -156,8 +163,10 @@ impl StreamView {
             hotkey_keys: Default::default(),
             key_grab,
             mouse_locked: false,
+            auto_locked: false,
+            auto_suppressed: false,
+            pending_lock: None,
             remote_cursor_visible: true,
-            remote_cursor_seen: false,
             cursors: Default::default(),
             show_stats: false,
             toast: None,
@@ -283,6 +292,14 @@ impl StreamView {
     }
 
     fn set_mouse_lock(&mut self, window: &Window, on: bool) {
+        self.set_mouse_lock_ex(window, on, false);
+    }
+
+    fn set_mouse_lock_ex(&mut self, window: &Window, on: bool, auto: bool) {
+        self.pending_lock = None;
+        if !on {
+            self.auto_locked = false;
+        }
         if on {
             let ok = window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -299,18 +316,56 @@ impl StreamView {
             s.send_ctrl(&crate::proto::Ctrl::CursorMode { local: !self.mouse_locked });
         }
         self.update_cursor_visibility(window);
-        if self.mouse_locked {
-            self.toast(vec!["Mouse locked to this window".into(), format!("{}+M to release", shortcut_prefix())], 3);
+        if on && self.mouse_locked {
+            self.auto_locked = auto;
+            let title = if auto { "Mouse captured by the game" } else { "Mouse locked to this window" };
+            self.toast(vec![title.into(), format!("{}+M to release", shortcut_prefix())], 3);
         } else if on {
             self.toast(vec!["Couldn't lock the mouse".into()], 3);
-        } else {
+        } else if !auto {
             self.toast(vec!["Mouse released".into()], 2);
         }
     }
 
+    /// Games hide the pointer when they take over the mouse: lock it here and send raw movement
+    /// then, and go back to normal when the pointer shows again.
+    fn schedule_auto_lock(&mut self) {
+        if !self.settings.auto_mouse_lock || self.settings.view_only {
+            return;
+        }
+        let hidden = !self.remote_cursor_visible;
+        let settle = Instant::now() + Duration::from_millis(120);
+        if !hidden {
+            self.auto_suppressed = false;
+            self.pending_lock = (self.mouse_locked && self.auto_locked).then_some((false, settle));
+        } else if !self.mouse_locked && !self.auto_suppressed && self.focused {
+            self.pending_lock = Some((true, settle));
+        } else {
+            self.pending_lock = None;
+        }
+    }
+
+    /// Applies a settled automatic lock/release. Call regularly (see `next_deadline`).
+    pub fn tick(&mut self, window: &Window) {
+        let Some((lock, at)) = self.pending_lock else { return };
+        if Instant::now() < at {
+            return;
+        }
+        self.pending_lock = None;
+        let hidden = !self.remote_cursor_visible;
+        if lock && hidden && !self.mouse_locked && self.focused {
+            self.set_mouse_lock_ex(window, true, true);
+        } else if !lock && !hidden && self.mouse_locked && self.auto_locked {
+            self.set_mouse_lock_ex(window, false, true);
+        }
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.pending_lock.map(|(_, at)| at)
+    }
+
     fn update_cursor_visibility(&self, window: &Window) {
-        let remote_hidden = self.remote_cursor_seen && !self.remote_cursor_visible;
-        window.set_cursor_visible(!self.mouse_locked && !remote_hidden);
+        window.set_cursor_visible(!self.mouse_locked && self.remote_cursor_visible);
     }
 
     /// Mirrors the host's pointer shape and visibility on our own cursor.
@@ -336,10 +391,10 @@ impl StreamView {
                 window.set_cursor(c.clone());
             }
         }
-        self.remote_cursor_seen |= msg.visible;
         if msg.visible != self.remote_cursor_visible {
             self.remote_cursor_visible = msg.visible;
             self.update_cursor_visibility(window);
+            self.schedule_auto_lock();
         }
     }
 
@@ -360,7 +415,13 @@ impl StreamView {
                 self.end = Some(StreamEnd::Closed);
             }
             0x09 => self.toggle_fullscreen(window),                    // F
-            0x10 => self.set_mouse_lock(window, !self.mouse_locked), // M
+            0x10 => {
+                // M
+                if self.mouse_locked && !self.remote_cursor_visible {
+                    self.auto_suppressed = true;
+                }
+                self.set_mouse_lock(window, !self.mouse_locked);
+            }
             0x16 => {
                 // S
                 self.show_stats = !self.show_stats;
@@ -504,8 +565,12 @@ impl StreamView {
                 if !f {
                     self.release_all();
                     if self.mouse_locked {
-                        self.set_mouse_lock(window, false);
+                        self.set_mouse_lock_ex(window, false, true);
                     }
+                    self.pending_lock = None;
+                } else {
+                    // Back in the game: capture again if it still has the pointer hidden.
+                    self.schedule_auto_lock();
                 }
             }
             WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
@@ -730,11 +795,18 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if self.view.as_ref().is_some_and(|v| v.overlay_is_live()) {
-            if self.last_paint.elapsed() >= Duration::from_millis(250) {
+        if let (Some(v), Some(w)) = (&mut self.view, &self.window) {
+            v.tick(w);
+        }
+        let deadline = self.view.as_ref().and_then(|v| v.next_deadline());
+        if self.view.as_ref().is_some_and(|v| v.overlay_is_live() || v.dirty) {
+            if self.last_paint.elapsed() >= Duration::from_millis(250) || self.view.as_ref().is_some_and(|v| v.dirty) {
                 self.paint();
             }
-            el.set_control_flow(ControlFlow::WaitUntil(self.last_paint + Duration::from_millis(250)));
+            let next = self.last_paint + Duration::from_millis(250);
+            el.set_control_flow(ControlFlow::WaitUntil(deadline.map_or(next, |d| d.min(next))));
+        } else if let Some(d) = deadline {
+            el.set_control_flow(ControlFlow::WaitUntil(d));
         } else {
             el.set_control_flow(ControlFlow::Wait);
         }

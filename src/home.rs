@@ -784,7 +784,7 @@ impl Home {
             egui::CollapsingHeader::new(theme::bold("Keyboard shortcuts while connected")).show(ui, |ui| {
                 let p = crate::window::shortcut_prefix();
                 egui::Grid::new("keys").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                    for (k, what) in [("Q", "disconnect"), ("F", "fullscreen on/off"), ("M", "lock the mouse (games)"), ("S", "show/hide stats")] {
+                    for (k, what) in [("Q", "disconnect"), ("F", "fullscreen on/off"), ("M", "lock or release the mouse"), ("S", "show/hide stats")] {
                         ui.label(RichText::new(format!("{p}+{k}")).monospace());
                         ui.label(what);
                         ui.end_row();
@@ -877,6 +877,8 @@ impl Home {
         changed |= theme::toggle_row(ui, &mut s.audio, "Play the other computer's sound", None);
         changed |= theme::toggle_row(ui, &mut s.clipboard, "Share copied text both ways", None);
         changed |= theme::toggle_row(ui, &mut s.grab_keyboard, "Send Cmd+Tab / Win key / Alt+Tab across", None);
+        let release = format!("For games that look around with the mouse. {}+M releases it.", crate::window::shortcut_prefix());
+        changed |= theme::toggle_row(ui, &mut s.auto_mouse_lock, "Capture the mouse when a game hides the pointer", Some(&release));
         changed |= theme::toggle_row(
             ui,
             &mut s.swap_ctrl_cmd,

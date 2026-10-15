@@ -289,6 +289,12 @@ impl ApplicationHandler<UserEvent> for HopApp {
         if self.test_quit_at.is_some_and(|t| Instant::now() >= t) {
             return el.exit();
         }
+        if let (Some(v), Some(w)) = (&mut self.view, &self.window) {
+            v.tick(w);
+            if v.dirty {
+                self.paint();
+            }
+        }
         if Instant::now() >= self.next_paint {
             if self.view.is_none() {
                 self.refresh_displays(el);
@@ -297,7 +303,8 @@ impl ApplicationHandler<UserEvent> for HopApp {
             self.handle_home_actions(el);
         }
         let mut wake = self.next_paint;
-        for t in [self.test_disconnect_at, self.test_quit_at].into_iter().flatten() {
+        let lock_at = self.view.as_ref().and_then(|v| v.next_deadline());
+        for t in [self.test_disconnect_at, self.test_quit_at, lock_at].into_iter().flatten() {
             wake = wake.min(t);
         }
         el.set_control_flow(ControlFlow::WaitUntil(wake));

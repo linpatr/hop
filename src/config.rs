@@ -24,6 +24,8 @@ pub struct StreamPrefs {
     pub grab_keyboard: bool,
     /// Share copied text both ways.
     pub clipboard: bool,
+    /// Capture the mouse (raw movement) while a game on the other computer hides the pointer.
+    pub auto_mouse_lock: bool,
 }
 
 impl Default for StreamPrefs {
@@ -40,6 +42,7 @@ impl Default for StreamPrefs {
             swap_ctrl_cmd: false,
             grab_keyboard: true,
             clipboard: true,
+            auto_mouse_lock: true,
         }
     }
 }

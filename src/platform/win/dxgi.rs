@@ -73,6 +73,8 @@ struct Duplicator {
     cursor_visible: bool,
     /// Pointer changes not yet reported to the viewer: (visibility changed, shape changed).
     cursor_news: (bool, bool),
+    /// The pointer's state has been reported at least once.
+    cursor_reported: bool,
     shape_buf: Vec<u8>,
 }
 
@@ -122,6 +124,7 @@ impl Duplicator {
                 cursor_pos: (0, 0),
                 cursor_visible: false,
                 cursor_news: (false, false),
+                cursor_reported: false,
                 shape_buf: Vec::new(),
             })
         }
@@ -148,11 +151,15 @@ impl Duplicator {
     fn process(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO, res: Option<IDXGIResource>) -> Result<bool> {
         let mut changed = false;
         if info.LastMouseUpdateTime != 0 {
-            let vis = info.PointerPosition.Visible.as_bool();
+            // "Hidden" should mean an app (a game) hid it. Windows also hides the pointer when no
+            // mouse is plugged in ("suppressed"); count that as visible.
+            let vis = info.PointerPosition.Visible.as_bool() || cursor_suppressed();
             let pos = (info.PointerPosition.Position.x, info.PointerPosition.Position.y);
             changed |= vis != self.cursor_visible || (vis && pos != self.cursor_pos);
-            if vis != self.cursor_visible {
+            // Always report the first state, e.g. a game that hid the pointer before we connected.
+            if vis != self.cursor_visible || !self.cursor_reported {
                 self.cursor_news.0 = true;
+                self.cursor_reported = true;
             }
             self.cursor_visible = vis;
             self.cursor_pos = pos;
@@ -222,6 +229,12 @@ impl Duplicator {
             Ok(r)
         }
     }
+}
+
+fn cursor_suppressed() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SUPPRESSED, CURSORINFO, GetCursorInfo};
+    let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut ci).is_ok() && ci.flags.0 & CURSOR_SUPPRESSED.0 != 0 }
 }
 
 /// Tells the viewer about pointer visibility/shape changes.
