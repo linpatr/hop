@@ -41,6 +41,10 @@ pub trait Capturer: Send {
     fn request_keyframe(&self);
     fn set_bitrate(&self, kbps: u32);
     fn encoder_name(&self) -> String;
+    /// False once capture has stopped by itself (e.g. the screen changed); the host restarts it.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 /// A decoded frame in NV12 with tightly packed rows (stride == width).

@@ -791,6 +791,13 @@ public func hop_mac_begin_activity() {
 
 private var sleepAssertion: IOPMAssertionID = 0
 
+/// Turns the display on if it went to sleep (ScreenCaptureKit sends nothing while it's off).
+@_cdecl("hop_mac_wake_display")
+public func hop_mac_wake_display() {
+    var id: IOPMAssertionID = 0
+    IOPMAssertionDeclareUserActivity("Hop remote session" as CFString, kIOPMUserActiveLocal, &id)
+}
+
 @_cdecl("hop_mac_prevent_sleep")
 public func hop_mac_prevent_sleep(_ on: Int32) {
     if on != 0 {

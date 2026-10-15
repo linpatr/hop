@@ -23,6 +23,11 @@ impl WinInjector {
     }
 }
 
+/// A one-pixel nudge counts as user input, which turns a sleeping display back on.
+pub fn nudge_mouse() {
+    send(&[mouse_input(1, 0, 0, MOUSEEVENTF_MOVE), mouse_input(-1, 0, 0, MOUSEEVENTF_MOVE)]);
+}
+
 fn send(inputs: &[INPUT]) {
     unsafe {
         SendInput(inputs, std::mem::size_of::<INPUT>() as i32);

@@ -41,6 +41,13 @@ When you connect, a hint with these shortcuts appears at the top of the viewer. 
 
 With "Send Cmd+Tab / Win key / Alt+Tab" on (default), system shortcuts on a Mac and Win / Alt+Tab / Alt+F4 on a PC go to the remote computer.
 
+### Using the PC with its monitor off
+
+Windows only draws the desktop to displays that are on, so with the monitor switched off there's nothing to stream. Hop handles this two ways:
+
+- **Monitor asleep:** Hop wakes it when you connect, and keeps it awake while you're connected.
+- **Monitor switched off or unplugged:** click **Set up virtual display** in Hop on the PC. It installs the free, open-source [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (MIT, signed), after one admin prompt; downloads are checked against fixed SHA-256 hashes. While the real monitor is on, Hop keeps the virtual display out of the way. When the monitor is off, Windows uses the virtual display and Hop sets it to your viewer's resolution. If you switch the monitor on or off mid-session, Hop restarts the capture at the new size. **Remove** uninstalls the driver.
+
 ### macOS permissions
 
 - **Screen & System Audio Recording**: to share this Mac's screen and sound.
@@ -83,7 +90,7 @@ Code map: `src/platform/` (mac.rs + `mac/HopMac.swift`, win/), `host.rs`, `clien
 ## Troubleshooting
 
 - `hop selftest` (Windows: `& "$env:LOCALAPPDATA\Programs\Hop\Hop.exe" selftest`) captures 3 seconds, encodes, decodes, and prints timings and the encoder used.
-- Logs: macOS `~/Library/Application Support/Hop/`, Windows `%APPDATA%\Hop\` (`hop.log`, `hop-viewer.log`, `hop-host.log`).
+- Logs: macOS `~/Library/Application Support/Hop/`, Windows `%APPDATA%\Hop\` (`hop.log`, `hop-viewer.log`, `hop-host.log`). The viewer also saves the other computer's log there as `remote-<name>.log`.
 - `HOP_LOG=debug` for more detail. `HOP_ENCODER=nvidia` (or `amd`, `intel`, `microsoft`) forces a Windows encoder.
 - Not listed? Connect by IP from the Hop window. Check the Windows firewall rule named "Hop".
 - Wi-Fi works, but Ethernet on at least one side is the single biggest latency/smoothness improvement.

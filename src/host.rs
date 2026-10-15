@@ -298,10 +298,16 @@ fn run_session(
     writer: &Writer,
     rx: &mut StreamCipher,
     client: &Hello,
-    native: (u32, u32),
+    native_at_welcome: (u32, u32),
     media_key: &[u8; 32],
     p: StartParams,
 ) -> Result<()> {
+    // A sleeping display draws nothing, so there'd be nothing to capture: wake it first (or on
+    // Windows, size the virtual display if the real monitor is off). The size may change.
+    platform::prepare_display(p.max, p.fps.clamp(10, 240));
+    platform::prevent_sleep(true);
+    let native = platform::native_display_size();
+    let _ = native_at_welcome;
     let (width, height) = platform::stream_size(native, p.max);
     let cfg = CaptureConfig {
         width,
@@ -321,8 +327,9 @@ fn run_session(
         video: Mutex::new((Packetizer::new(p.fec_percent.min(100)), Vec::with_capacity(1500))),
         audio: Mutex::new(AudioState::default()),
         bytes: sent_bytes.clone(),
+        frames: AtomicU64::new(0),
     });
-    let capturer = match platform::start_capture(&cfg, sink) {
+    let capturer = match platform::start_capture(&cfg, sink.clone()) {
         Ok(c) => c,
         Err(e) => {
             let _ = send_shared(writer, &Ctrl::Error { message: format!("{e:#}") });
@@ -348,7 +355,25 @@ fn run_session(
         });
         st.last_event = Some(format!("{} connected", client.name));
     }
-    platform::prevent_sleep(true);
+
+    // Watch the capture: tell the viewer if no picture is coming (typically the monitor is off),
+    // and restart capture if it stopped (e.g. the monitor was switched on or off, so Windows
+    // moved to a different screen or resolution).
+    let session_done = Arc::new(AtomicBool::new(false));
+    {
+        let ctx = Supervisor {
+            sink: sink.clone(),
+            writer: writer.clone(),
+            active: active.clone(),
+            done: session_done.clone(),
+            name: shared.name.clone(),
+            max: p.max,
+            fps: cfg.fps,
+            bitrate_kbps: cfg.bitrate_kbps,
+            audio: cfg.audio,
+        };
+        std::thread::Builder::new().name("capture-watch".into()).spawn(move || ctx.run())?;
+    }
 
     let mut injector = platform::new_injector()?;
     let clip_stop = Arc::new(AtomicBool::new(false));
@@ -396,6 +421,9 @@ fn run_session(
                 }
             }
             Message::Ctrl(Ctrl::Ping { ts }) => send_shared(writer, &Ctrl::Pong { ts })?,
+            Message::Ctrl(Ctrl::LogRequest) => {
+                send_shared(writer, &Ctrl::Log { text: crate::logging::tail(64 * 1024) })?;
+            }
             Message::Ctrl(Ctrl::Clipboard { text }) => {
                 if let Some(c) = &clip {
                     c.apply(text);
@@ -406,8 +434,83 @@ fn run_session(
         }
     }
     clip_stop.store(true, Ordering::SeqCst);
+    session_done.store(true, Ordering::SeqCst);
     injector.input(Input::ReleaseAll);
     Ok(())
+}
+
+struct Supervisor {
+    sink: Arc<HostSink>,
+    writer: Writer,
+    active: Arc<Active>,
+    done: Arc<AtomicBool>,
+    name: String,
+    max: (u32, u32),
+    fps: u32,
+    bitrate_kbps: u32,
+    audio: bool,
+}
+
+impl Supervisor {
+    fn notice(&self, message: String) {
+        let _ = send_shared(&self.writer, &Ctrl::Notice { message });
+    }
+
+    fn run(self) {
+        let mut started = Instant::now();
+        let mut frames_at_start = 0;
+        let mut warned = false;
+        while !self.done.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+            let frames = self.sink.frames.load(Ordering::Relaxed);
+            if frames > frames_at_start {
+                if warned {
+                    self.notice(String::new());
+                    warned = false;
+                }
+            } else if !warned && started.elapsed() > Duration::from_secs(3) {
+                log::warn!("no frames from the display after 3 s");
+                let n = &self.name;
+                self.notice(format!(
+                    "{n}'s screen isn't producing a picture: its monitor is probably off. Turn it on, or set up the virtual display in Hop on {n} so this works with the monitor off."
+                ));
+                warned = true;
+            }
+            let dead = self.active.capturer.lock().as_ref().is_some_and(|c| !c.is_alive());
+            if !dead {
+                continue;
+            }
+            log::info!("capture stopped; restarting it for the current screen");
+            drop(self.active.capturer.lock().take());
+            while !self.done.load(Ordering::Relaxed) {
+                platform::prepare_display(self.max, self.fps);
+                let native = platform::native_display_size();
+                let (width, height) = platform::stream_size(native, self.max);
+                let cfg = CaptureConfig {
+                    width,
+                    height,
+                    fps: self.fps,
+                    bitrate_kbps: self.bitrate_kbps,
+                    audio: self.audio,
+                };
+                match platform::start_capture(&cfg, self.sink.clone()) {
+                    Ok(c) => {
+                        let encoder = c.encoder_name();
+                        *self.active.capturer.lock() = Some(c);
+                        log::info!("capture restarted at {width}x{height}");
+                        let _ = send_shared(&self.writer, &Ctrl::StreamInfo { width, height, fps: cfg.fps, encoder });
+                        break;
+                    }
+                    Err(e) => {
+                        log::info!("screen not capturable yet: {e:#}");
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+            started = Instant::now();
+            frames_at_start = self.sink.frames.load(Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -428,6 +531,8 @@ struct HostSink {
     video: Mutex<(Packetizer, Vec<u8>)>,
     audio: Mutex<AudioState>,
     bytes: Arc<AtomicU64>,
+    /// Encoded frames so far (whether or not they could be sent yet).
+    frames: AtomicU64,
 }
 
 impl HostSink {
@@ -468,6 +573,9 @@ impl FrameSink for HostSink {
     }
 
     fn video(&self, data: &[u8], keyframe: bool, capture_us: u64) {
+        if self.frames.fetch_add(1, Ordering::Relaxed) == 0 {
+            log::info!("first video frame encoded ({} bytes, keyframe {keyframe})", data.len());
+        }
         let Some(addr) = *self.active.client_addr.lock() else { return };
         let latency = platform::now_us().saturating_sub(capture_us).min(u32::MAX as u64) as u32;
         let mut g = self.video.lock();

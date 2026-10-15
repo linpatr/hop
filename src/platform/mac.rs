@@ -48,6 +48,7 @@ unsafe extern "C" {
     fn hop_mac_open_privacy(kind: i32);
     fn hop_mac_begin_activity();
     fn hop_mac_prevent_sleep(on: i32);
+    fn hop_mac_wake_display();
     fn hop_mac_keytap_start(ctx: *mut c_void, cb: KeyCb) -> i32;
     fn hop_mac_yield_activation(pid: i32) -> i32;
     fn hop_mac_activate_self();
@@ -96,6 +97,11 @@ pub fn stream_size(native: (u32, u32), max: (u32, u32)) -> (u32, u32) {
 
 pub fn prevent_sleep(on: bool) {
     unsafe { hop_mac_prevent_sleep(on as i32) }
+}
+
+/// Turns the display on if it's asleep (a sleeping display sends no frames).
+pub fn prepare_display(_max: (u32, u32), _fps: u32) {
+    unsafe { hop_mac_wake_display() }
 }
 
 pub fn platform_init() {

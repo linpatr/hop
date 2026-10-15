@@ -457,8 +457,10 @@ impl App {
         if let Some(since) = self.reconnecting {
             let left = RECONNECT_FOR.saturating_sub(since.elapsed()).as_secs();
             ov.banner = Some(("Connection lost".into(), format!("Reconnecting to {}…  ({left}s)", self.host_name)));
-        } else if !self.got_frame && self.session.is_some() {
-            ov.banner = Some(("Waiting for video…".into(), String::new()));
+        } else if !self.got_frame
+            && let Some(s) = &self.session
+        {
+            ov.banner = Some(("Waiting for video…".into(), s.notice.lock().clone()));
         }
         if self.show_stats
             && let Some(s) = &self.session
@@ -538,7 +540,6 @@ impl ApplicationHandler<UserEvent> for App {
                 // The host deliberately ended things: don't fight it.
                 let deliberate = reason.is_empty()
                     || reason.contains("ended the session")
-                    || reason.contains("display is now")
                     || reason.contains("permission");
                 if deliberate {
                     let code = if reason.is_empty() { EXIT_OK } else { EXIT_ERROR };

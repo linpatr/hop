@@ -5,6 +5,7 @@ mod input;
 mod keyhook;
 mod mfdec;
 mod mfenc;
+pub mod vdisplay;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -69,6 +70,23 @@ pub fn stream_size(native: (u32, u32), max: (u32, u32)) -> (u32, u32) {
     (w as u32, h as u32)
 }
 
+/// Gets the screen ready to stream: wakes a sleeping monitor, or, if the real monitor is off and
+/// the virtual display took over, sets that to the viewer's resolution.
+pub fn prepare_display(max: (u32, u32), fps: u32) {
+    wake_display();
+    if vdisplay::prepare_for_stream(max, fps) {
+        std::thread::sleep(Duration::from_millis(800));
+    }
+}
+
+/// Windows only draws the desktop while a display is on, so wake it before capturing.
+pub fn wake_display() {
+    unsafe {
+        SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    }
+    input::nudge_mouse();
+}
+
 pub fn prevent_sleep(on: bool) {
     unsafe {
         let flags = if on { ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS };
@@ -107,8 +125,15 @@ impl CaptureShared {
     }
 
     /// Next frame for the encoder: a new capture, or the previous one again when a keyframe is
-    /// wanted and the screen hasn't changed. Returns (frame, timestamp_us, force_keyframe).
-    pub fn next_input(&self, last_seq: &mut u64, last: &mut Option<Arc<RawFrame>>) -> Option<(Arc<RawFrame>, u64, bool)> {
+    /// wanted or nothing changed for `repeat_after`. Repeating keeps frames moving through
+    /// hardware encoders that hold one back (otherwise a still screen can strand the keyframe
+    /// the viewer is waiting for). Returns (frame, timestamp_us, force_keyframe).
+    pub fn next_input(
+        &self,
+        last_seq: &mut u64,
+        last: &mut Option<Arc<RawFrame>>,
+        repeat_after: Duration,
+    ) -> Option<(Arc<RawFrame>, u64, bool)> {
         let mut g = self.slot.lock();
         let mut waited = Duration::ZERO;
         loop {
@@ -131,8 +156,13 @@ impl CaptureShared {
                 self.keyframe.store(false, Ordering::Release);
                 return Some((f, now_us(), true));
             }
-            self.cv.wait_for(&mut g, Duration::from_millis(10));
-            waited += Duration::from_millis(10);
+            if waited >= repeat_after
+                && let Some(f) = last.clone()
+            {
+                return Some((f, now_us(), false));
+            }
+            self.cv.wait_for(&mut g, Duration::from_millis(8));
+            waited += Duration::from_millis(8);
         }
     }
 }
@@ -228,6 +258,9 @@ impl Capturer for WinCapturer {
     }
     fn encoder_name(&self) -> String {
         self.encoder.clone()
+    }
+    fn is_alive(&self) -> bool {
+        !self.shared.stop.load(Ordering::Relaxed)
     }
 }
 

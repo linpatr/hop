@@ -168,6 +168,8 @@ pub struct ClientShared {
     pub frame: Mutex<Option<Nv12Frame>>,
     /// Latest pointer update from the host, waiting for the window to apply it.
     pub cursor: Mutex<Option<CursorMsg>>,
+    /// A message from the host to show while waiting for video.
+    pub notice: Mutex<String>,
     pub spare: Mutex<Vec<Nv12Frame>>,
     pub stats: Mutex<ClientStats>,
     pub stop: AtomicBool,
@@ -213,18 +215,30 @@ fn media_socket() -> Result<UdpSocket> {
 }
 
 pub fn start(conn: Connection, notify: impl Fn(Event) + Send + Sync + 'static) -> Result<Arc<ClientShared>> {
-    let Connection { info, mut tcp, tx, mut rx, keys, host_media, audio, clipboard, .. } = conn;
+    let Connection { host, info, mut tcp, tx, mut rx, keys, host_media, audio, clipboard } = conn;
+    let host_name = host.name.clone();
     let notify = Arc::new(notify);
     tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
     let shared = Arc::new(ClientShared {
         frame: Mutex::new(None),
         cursor: Mutex::new(None),
+        notice: Mutex::new(String::new()),
         spare: Mutex::new(Vec::new()),
         stats: Mutex::new(ClientStats { width: info.width, height: info.height, ..Default::default() }),
         stop: AtomicBool::new(false),
         writer: Mutex::new((tcp.try_clone()?, tx)),
     });
     let rtt = Arc::new(Mutex::new(0f32));
+    // Fetch the host's log a few seconds in, so problems on the other computer can be read here.
+    {
+        let sh = shared.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(8));
+            if !sh.stop.load(Ordering::Relaxed) {
+                sh.send_ctrl(&Ctrl::LogRequest);
+            }
+        });
+    }
     let clip = clipboard.then(|| {
         let c = ClipState::new();
         let sh = shared.clone();
@@ -272,6 +286,8 @@ pub fn start(conn: Connection, notify: impl Fn(Event) + Send + Sync + 'static) -
                             c.apply(text);
                         }
                     }
+                    Ok(Message::Ctrl(Ctrl::Notice { message })) => *shared.notice.lock() = message,
+                    Ok(Message::Ctrl(Ctrl::Log { text })) => save_remote_log(&host_name, &text),
                     Ok(Message::Ctrl(Ctrl::Error { message })) => break message,
                     Ok(Message::Ctrl(Ctrl::Bye)) => break "The host ended the session".into(),
                     _ => {}
@@ -453,5 +469,15 @@ fn dump_frame(f: &Nv12Frame, path: &str) {
     match std::fs::write(path, out) {
         Ok(()) => log::info!("dumped frame to {path}"),
         Err(e) => log::warn!("dump failed: {e}"),
+    }
+}
+
+/// Saves the other computer's log next to ours, as remote-<name>.log.
+fn save_remote_log(host_name: &str, text: &str) {
+    let safe: String = host_name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    let path = crate::config::dir().join(format!("remote-{safe}.log"));
+    match std::fs::write(&path, text) {
+        Ok(()) => log::info!("saved {host_name}'s log to {}", path.display()),
+        Err(e) => log::warn!("couldn't save remote log: {e}"),
     }
 }

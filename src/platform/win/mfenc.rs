@@ -91,6 +91,8 @@ struct Encoder {
     owed_inputs: u32,
     /// Outputs at or before this timestamp come from the startup probe and are dropped.
     probe_ts: u64,
+    /// A keyframe was requested and hasn't come out yet: (when it was fed, inputs fed since).
+    awaiting_key: Option<(std::time::Instant, u32)>,
     pub name: String,
     pub hardware: bool,
 }
@@ -180,6 +182,7 @@ impl Encoder {
                 last_ts: 0,
                 owed_inputs: 0,
                 probe_ts: 0,
+                awaiting_key: None,
                 name: name.to_string(),
                 hardware,
             })
@@ -317,37 +320,68 @@ impl Encoder {
         bail!("{} produced no output", self.name)
     }
 
+    /// How long to wait for a new screen frame before feeding the last one again.
+    fn repeat_after(&self) -> Duration {
+        if self.awaiting_key.is_some() { Duration::from_millis(16) } else { Duration::from_millis(100) }
+    }
+
+    fn feed_frame(&mut self, sh: &CaptureShared, f: &RawFrame, ts: u64, force: bool) -> Result<()> {
+        self.set_bitrate(sh.bitrate_kbps.load(Ordering::Relaxed));
+        if force {
+            self.awaiting_key = Some((Instant::now(), 0));
+        }
+        if let Some((_, n)) = &mut self.awaiting_key {
+            *n += 1;
+        }
+        self.feed(&f.nv12, ts, force)
+    }
+
+    fn emit(&mut self, sink: &SharedSink, data: &[u8], key: bool, ts: u64) {
+        if ts <= self.probe_ts {
+            return;
+        }
+        if key && let Some((t, n)) = self.awaiting_key.take() {
+            log::debug!("keyframe out {:.1} ms after request ({n} input(s))", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        sink.video(data, key, ts);
+    }
+
     fn run(&mut self, sh: &CaptureShared, sink: &SharedSink) -> Result<()> {
         let mut last_seq = 0u64;
         let mut last: Option<Arc<RawFrame>> = None;
         match self.events.clone() {
             None => loop {
-                let Some((f, ts, force)) = sh.next_input(&mut last_seq, &mut last) else { return Ok(()) };
-                self.set_bitrate(sh.bitrate_kbps.load(Ordering::Relaxed));
-                self.feed(&f.nv12, ts, force)?;
-                self.drain_outputs(sink)?;
+                let Some((f, ts, force)) = sh.next_input(&mut last_seq, &mut last, self.repeat_after()) else {
+                    return Ok(());
+                };
+                self.feed_frame(sh, &f, ts, force)?;
+                while let Some((data, key, ts)) = self.pull()? {
+                    self.emit(sink, &data, key, ts);
+                }
             },
             Some(ev) => loop {
                 if sh.stop.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 while self.owed_inputs > 0 {
-                    let Some((f, ts, force)) = sh.next_input(&mut last_seq, &mut last) else { return Ok(()) };
-                    self.feed(&f.nv12, ts, force)?;
+                    let Some((f, ts, force)) = sh.next_input(&mut last_seq, &mut last, self.repeat_after()) else {
+                        return Ok(());
+                    };
+                    self.feed_frame(sh, &f, ts, force)?;
                     self.owed_inputs -= 1;
                 }
                 // Blocks until the encoder wants input or has output; both happen every frame.
                 let e = unsafe { ev.GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))? };
                 let ty = MF_EVENT_TYPE(unsafe { e.GetType()? } as i32);
                 if ty == METransformNeedInput {
-                    let Some((f, ts, force)) = sh.next_input(&mut last_seq, &mut last) else { return Ok(()) };
-                    self.set_bitrate(sh.bitrate_kbps.load(Ordering::Relaxed));
-                    self.feed(&f.nv12, ts, force)?;
+                    let Some((f, ts, force)) = sh.next_input(&mut last_seq, &mut last, self.repeat_after()) else {
+                        return Ok(());
+                    };
+                    self.feed_frame(sh, &f, ts, force)?;
                 } else if ty == METransformHaveOutput
                     && let Some((data, key, ts)) = self.pull()?
-                    && ts > self.probe_ts
                 {
-                    sink.video(&data, key, ts);
+                    self.emit(sink, &data, key, ts);
                 }
             },
         }

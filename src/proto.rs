@@ -69,6 +69,11 @@ pub enum Ctrl {
     /// host leaves it out of the video and sends pointer shapes instead. Off while the mouse is
     /// locked for games.
     CursorMode { local: bool },
+    /// Host -> client: something the user should know while waiting (empty clears it).
+    Notice { message: String },
+    /// Client -> host: send the end of your log (for troubleshooting from the other computer).
+    LogRequest,
+    Log { text: String },
     Bye,
 }
 

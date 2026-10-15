@@ -62,6 +62,20 @@ struct Launcher {
     last_client: Option<String>,
     quitting: bool,
     copied_at: Option<Instant>,
+    #[cfg(windows)]
+    vdisplay: Arc<Mutex<VdState>>,
+    #[cfg(windows)]
+    last_tidy: Instant,
+}
+
+/// Virtual display driver state, for the setup buttons (Windows).
+#[cfg(windows)]
+#[derive(Clone)]
+enum VdState {
+    NotInstalled,
+    Installed,
+    Busy(&'static str),
+    Failed(String),
 }
 
 pub fn run() -> i32 {
@@ -93,6 +107,14 @@ pub fn run() -> i32 {
         last_client: None,
         quitting: false,
         copied_at: None,
+        #[cfg(windows)]
+        vdisplay: Arc::new(Mutex::new(if crate::platform::vdisplay::is_installed() {
+            VdState::Installed
+        } else {
+            VdState::NotInstalled
+        })),
+        #[cfg(windows)]
+        last_tidy: Instant::now(),
     };
     // Opening ports from a not-yet-installed copy would make Windows Firewall ask about the wrong
     // file, so networking waits for Install.
@@ -444,6 +466,70 @@ impl Launcher {
         }
     }
 
+    /// Windows: set up the virtual display used while the monitor is off.
+    #[cfg(windows)]
+    fn virtual_display(&mut self, ui: &mut egui::Ui) {
+        use crate::platform::vdisplay;
+        // Keep the virtual display off the desktop while a real monitor is in use.
+        let streaming = self.host.as_ref().is_some_and(|h| h.status.lock().session.is_some());
+        if !streaming && self.last_tidy.elapsed() > Duration::from_secs(5) {
+            self.last_tidy = Instant::now();
+            if matches!(*self.vdisplay.lock(), VdState::Installed) {
+                vdisplay::tidy();
+            }
+        }
+        let start = |action: &'static str, state: Arc<Mutex<VdState>>| {
+            *state.lock() = VdState::Busy(if action == "install" { "Setting up" } else { "Removing" });
+            std::thread::spawn(move || {
+                let r = vdisplay::run_setup(action);
+                *state.lock() = match r {
+                    Ok(()) if vdisplay::is_installed() => VdState::Installed,
+                    Ok(()) => VdState::NotInstalled,
+                    Err(e) => VdState::Failed(format!("{e:#}")),
+                };
+            });
+        };
+        ui.add_space(6.0);
+        let state = self.vdisplay.lock().clone();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("Virtual display").strong());
+            match &state {
+                VdState::Installed => {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(GREEN, "✓ Ready: used automatically when this PC's monitor is off.");
+                        if ui.small_button("Remove").clicked() {
+                            start("remove", self.vdisplay.clone());
+                        }
+                    });
+                }
+                VdState::Busy(what) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("{what}… approve the Windows prompt if it asks."));
+                    });
+                }
+                VdState::NotInstalled | VdState::Failed(_) => {
+                    ui.label("With the monitor off, Windows draws nothing, so there's nothing to stream. A virtual display fixes that.");
+                    ui.label(
+                        RichText::new(
+                            "Installs the free, open-source Virtual Display Driver (github.com/VirtualDrivers). Windows asks for admin permission once.",
+                        )
+                        .weak(),
+                    );
+                    if let VdState::Failed(e) = &state {
+                        ui.colored_label(RED, e);
+                    }
+                    if ui.button("Set up virtual display").clicked() {
+                        start("install", self.vdisplay.clone());
+                    }
+                }
+            }
+        });
+        if matches!(state, VdState::Busy(_)) {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn permissions(&mut self, ui: &mut egui::Ui) {
         if self.perms.1.elapsed() > Duration::from_secs(2) {
@@ -688,6 +774,10 @@ impl eframe::App for Launcher {
             self.this_computer(ui);
             #[cfg(target_os = "macos")]
             self.permissions(ui);
+            #[cfg(windows)]
+            if self.cfg.hosting && !self.portable_pending {
+                self.virtual_display(ui);
+            }
             if crate::autostart::available() && !self.portable_pending {
                 let mut on = self.autostart;
                 if ui.checkbox(&mut on, "Start Hop when I sign in").changed() {

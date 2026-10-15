@@ -256,12 +256,18 @@ pub fn capture_thread(
     let mut pool: Vec<Arc<RawFrame>> = Vec::new();
     let mut patch = Vec::new();
     let mut logged_wait = false;
+    let started = std::time::Instant::now();
     while !sh.stop.load(Ordering::Relaxed) {
         let mut dup = match Duplicator::new() {
             Ok(d) => d,
             Err(e) => {
-                if let Some(r) = ready.take() {
-                    let _ = r.send(Err(e.context("can't capture the screen (Desktop Duplication)")));
+                // A display that's just waking up can take a few seconds to become capturable.
+                if started.elapsed() > Duration::from_secs(5)
+                    && let Some(r) = ready.take()
+                {
+                    let _ = r.send(Err(e.context(
+                        "can't capture the screen (is the PC's monitor switched off or unplugged?)",
+                    )));
                     return;
                 }
                 // Typical while the lock screen or a UAC prompt (secure desktop) is up.
@@ -277,8 +283,8 @@ pub fn capture_thread(
         let (sw, shh) = (dup.width as usize, dup.height as usize);
         let (ow, oh) = convert::output_size(sw, shh, scale);
         if (ow as u32, oh as u32) != out {
-            let msg = format!("display is now {sw}x{shh}; reconnect to pick up the new resolution");
-            log::warn!("{msg}");
+            let msg = format!("display is now {sw}x{shh}");
+            log::info!("{msg}; capture will restart at the new size");
             if let Some(r) = ready.take() {
                 let _ = r.send(Err(anyhow!(msg)));
             }
@@ -286,7 +292,7 @@ pub fn capture_thread(
             return;
         }
         if let Some(r) = ready.take() {
-            log::info!("capturing {sw}x{shh}, scale 1/{scale} -> {ow}x{oh}");
+            log::info!("capturing {sw}x{shh}, scale 1/{scale} -> {ow}x{oh} (desktop ready after {:.1} s)", started.elapsed().as_secs_f64());
             let _ = r.send(Ok(()));
         }
         loop {

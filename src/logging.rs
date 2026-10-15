@@ -59,3 +59,15 @@ pub fn init(file_name: &str) {
 pub fn path(file_name: &str) -> std::path::PathBuf {
     crate::config::dir().join(file_name)
 }
+
+/// The last `max` bytes of this computer's logs (the app's and the headless host's).
+pub fn tail(max: usize) -> String {
+    let mut out = String::new();
+    for name in ["hop.log", "hop-host.log"] {
+        let Ok(b) = std::fs::read(path(name)) else { continue };
+        let start = b.len().saturating_sub(max / 2);
+        out.push_str(&format!("===== {name} =====\n"));
+        out.push_str(&String::from_utf8_lossy(&b[start..]));
+    }
+    out
+}
