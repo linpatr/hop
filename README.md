@@ -19,6 +19,12 @@ Both install to `%LOCALAPPDATA%\Programs\Hop`, add a Start menu shortcut and a s
 
 Then, on either computer, click **Connect** next to the other one. The first time, type the access code shown on the other computer. It's remembered after that.
 
+- The Hop window shows who's connected to this computer, with a **Disconnect** button. The window flashes when someone connects.
+- **Rename** sets the name your other computers see.
+- Closing the Hop window keeps hosting in the background (minimized). **Quit Hop** at the bottom really quits.
+- If Wi-Fi drops for a moment, the viewer reconnects by itself (for up to 30 seconds).
+- Five wrong access codes lock the host for a minute, and the viewer says so.
+
 ### Shortcuts while connected (Mac: Ctrl+Option+Shift)
 
 | Ctrl+Alt+Shift + | |
@@ -28,7 +34,9 @@ Then, on either computer, click **Connect** next to the other one. The first tim
 | M | lock the mouse to the window (games) |
 | S | show/hide stats in the title bar |
 
-With "Send system shortcuts" on (default), Cmd+Tab / Cmd+Space on a Mac and Win / Alt+Tab / Alt+F4 on a PC go to the remote computer.
+When you connect, a hint with these shortcuts appears at the top of the viewer. **S** shows a stats panel: resolution, fps, bitrate, the latency breakdown (host + network + decode), and lost/repaired packets.
+
+With "Send Cmd+Tab / Win key / Alt+Tab" on (default), system shortcuts on a Mac and Win / Alt+Tab / Alt+F4 on a PC go to the remote computer.
 
 ### macOS permissions
 

@@ -54,6 +54,8 @@ pub struct KnownHost {
 pub struct Config {
     pub id: String,
     pub name: String,
+    /// True once the user renamed this computer; otherwise the name follows the system's.
+    pub name_customized: bool,
     pub access_code: String,
     pub hosting: bool,
     pub known_hosts: HashMap<String, KnownHost>,
@@ -65,6 +67,7 @@ impl Default for Config {
         Self {
             id: String::new(),
             name: String::new(),
+            name_customized: false,
             access_code: String::new(),
             hosting: true,
             known_hosts: HashMap::new(),
@@ -97,7 +100,7 @@ impl Config {
             c.access_code = crate::crypto::random_code();
             changed = true;
         }
-        if c.name.is_empty() {
+        if c.name.is_empty() || !c.name_customized {
             c.name = default_name();
         }
         if changed {
@@ -116,7 +119,15 @@ impl Config {
     }
 }
 
+/// The computer's friendly name: "Patrick's Mac mini" on macOS, the PC name on Windows.
 pub fn default_name() -> String {
+    #[cfg(target_os = "macos")]
+    if let Ok(o) = std::process::Command::new("/usr/sbin/scutil").args(["--get", "ComputerName"]).output() {
+        let n = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if o.status.success() && !n.is_empty() {
+            return n;
+        }
+    }
     let h = gethostname::gethostname().to_string_lossy().into_owned();
     let h = h.trim_end_matches(".local").trim_end_matches(".lan").to_string();
     if h.is_empty() { "Computer".into() } else { h }

@@ -78,8 +78,16 @@ pub fn client_handshake(s: &mut TcpStream, code: &str, me: &Hello) -> Result<(He
     write_frame(s, &my_hello)?;
     let their_hello_raw = read_frame(s).context("host closed the connection")?;
     let their_hello: Hello = serde_json::from_slice(&their_hello_raw)?;
+    if let Some(e) = &their_hello.error {
+        return Err(HostRefused(e.clone()).into());
+    }
     if their_hello.hop != PROTOCOL_VERSION {
-        bail!("version mismatch: host speaks v{}, we speak v{}", their_hello.hop, PROTOCOL_VERSION);
+        bail!(
+            "{} runs a different version of Hop (protocol v{}, this one is v{}); update both",
+            their_hello.name,
+            their_hello.hop,
+            PROTOCOL_VERSION
+        );
     }
     let (spake, msg) = Spake2::<Ed25519Group>::start_symmetric(
         &Password::new(normalize_code(code).as_bytes()),
@@ -90,6 +98,25 @@ pub fn client_handshake(s: &mut TcpStream, code: &str, me: &Hello) -> Result<(He
     let shared = spake.finish(&their_msg).map_err(|e| anyhow!("key exchange failed: {e:?}"))?;
     let keys = derive(&shared, &transcript(&my_hello, &their_hello_raw, &msg, &their_msg));
     Ok((their_hello, keys))
+}
+
+/// The host turned the connection down; the message is meant for the user.
+#[derive(Debug)]
+pub struct HostRefused(pub String);
+
+impl std::fmt::Display for HostRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostRefused {}
+
+/// Tells a connecting client why it can't connect, then gives up on it.
+pub fn host_refuse(s: &mut TcpStream, me: &Hello, why: &str) -> Result<()> {
+    let _ = read_frame(s)?;
+    let refusal = Hello { error: Some(why.to_string()), ..me.clone() };
+    write_frame(s, &serde_json::to_vec(&refusal)?)
 }
 
 /// Host side of the handshake.
@@ -200,7 +227,7 @@ mod tests {
     use std::net::TcpListener;
 
     fn hello(name: &str) -> Hello {
-        Hello { hop: PROTOCOL_VERSION, id: name.into(), name: name.into(), os: "test".into() }
+        Hello { hop: PROTOCOL_VERSION, id: name.into(), name: name.into(), os: "test".into(), error: None }
     }
 
     fn run(host_code: &'static str, client_code: &'static str) -> bool {

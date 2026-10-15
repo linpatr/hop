@@ -2,6 +2,8 @@
 //!
 //! Local shortcuts (Ctrl+Alt+Shift, i.e. Ctrl+Option+Shift on a Mac):
 //!   Q  disconnect      F  toggle fullscreen      M  toggle mouse lock (games)      S  toggle stats
+//!
+//! Status lines starting with `HOP_STATUS ` on stderr tell the launcher what's happening.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,20 +11,22 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use crate::client::{self, ClientShared, ConnectError, ConnectOptions, Event};
+use crate::client::{self, ClientShared, ConnectError, ConnectOptions, Connection, Event};
 use crate::keymap;
 use crate::proto::Input;
-use crate::render::Renderer;
+use crate::render::{Overlay, Renderer};
 
 pub enum UserEvent {
     Frame,
     Closed(String),
     /// A key captured by the system-wide keyboard grab.
     Key { hid: u16, down: bool, repeat: bool },
+    Reconnected(Box<Connection>),
+    GaveUp(String),
 }
 
 pub struct StreamSettings {
@@ -42,6 +46,23 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_WRONG_CODE: i32 = 2;
 
+const RECONNECT_FOR: Duration = Duration::from_secs(30);
+
+fn shortcut_prefix() -> &'static str {
+    if cfg!(target_os = "macos") { "Ctrl+Option+Shift" } else { "Ctrl+Alt+Shift" }
+}
+
+/// Tells the launcher (which reads our stderr) what state we're in.
+fn report(state: &str, host: Option<&crate::proto::Hello>) {
+    let mut v = serde_json::json!({ "state": state });
+    if let Some(h) = host {
+        v["id"] = h.id.clone().into();
+        v["name"] = h.name.clone().into();
+        v["os"] = h.os.clone().into();
+    }
+    eprintln!("HOP_STATUS {v}");
+}
+
 struct App {
     settings: StreamSettings,
     proxy: EventLoopProxy<UserEvent>,
@@ -52,6 +73,7 @@ struct App {
     exit_message: Option<String>,
     host_name: String,
     host_os: String,
+    encoder: String,
     focused: bool,
     /// Physical keys held on this computer (before any Ctrl/Cmd swap).
     local_down: std::collections::HashSet<u16>,
@@ -60,11 +82,14 @@ struct App {
     key_grab: bool,
     mouse_locked: bool,
     show_stats: bool,
+    toast: Option<(Vec<String>, Instant)>,
+    reconnecting: Option<Instant>,
+    got_frame: bool,
+    last_paint: Instant,
     last_abs: Option<(u16, u16)>,
     rel_accum: (f64, f64),
     wheel_accum: (f64, f64),
     pressed: std::collections::HashSet<u16>,
-    last_title: Instant,
 }
 
 pub fn run(settings: StreamSettings) -> i32 {
@@ -93,17 +118,21 @@ pub fn run(settings: StreamSettings) -> i32 {
         exit_message: None,
         host_name: String::new(),
         host_os: String::new(),
+        encoder: String::new(),
         focused: true,
         local_down: Default::default(),
         hotkey_keys: Default::default(),
         key_grab: false,
         mouse_locked: false,
-        show_stats: true,
+        show_stats: false,
+        toast: None,
+        reconnecting: None,
+        got_frame: false,
+        last_paint: Instant::now(),
         last_abs: None,
         rel_accum: (0.0, 0.0),
         wheel_accum: (0.0, 0.0),
         pressed: Default::default(),
-        last_title: Instant::now(),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("event loop: {e}");
@@ -125,6 +154,11 @@ impl App {
         el.exit();
     }
 
+    fn toast(&mut self, lines: Vec<String>, secs: u64) {
+        self.toast = Some((lines, Instant::now() + Duration::from_secs(secs)));
+        self.paint();
+    }
+
     fn connect(&mut self, el: &ActiveEventLoop) {
         let monitor = el.primary_monitor().or_else(|| el.available_monitors().next());
         let screen = monitor.as_ref().map(|m| m.size()).map(|s| (s.width, s.height)).unwrap_or((1920, 1080));
@@ -140,11 +174,8 @@ impl App {
             Err(ConnectError::WrongCode) => return self.fail(el, EXIT_WRONG_CODE, "Wrong access code".into()),
             Err(e) => return self.fail(el, EXIT_ERROR, e.to_string()),
         };
-        self.host_name = conn.host.name.clone();
-        self.host_os = conn.host.os.clone();
         let (vw, vh) = (conn.info.width, conn.info.height);
-
-        let mut attrs = Window::default_attributes().with_title(format!("Hop — {}", self.host_name));
+        let mut attrs = Window::default_attributes().with_title(format!("Hop — {}", conn.host.name));
         // Open at the stream's size, shrunk to fit the screen.
         let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
         let (sw, sh) = (screen.0 as f64 / scale * 0.9, screen.1 as f64 / scale * 0.9);
@@ -162,16 +193,6 @@ impl App {
             Ok(r) => r,
             Err(e) => return self.fail(el, EXIT_ERROR, format!("graphics init failed: {e:#}")),
         };
-        let proxy = self.proxy.clone();
-        let session = match client::start(conn, move |e| {
-            let _ = proxy.send_event(match e {
-                Event::Frame => UserEvent::Frame,
-                Event::Closed(r) => UserEvent::Closed(r),
-            });
-        }) {
-            Ok(s) => s,
-            Err(e) => return self.fail(el, EXIT_ERROR, format!("{e:#}")),
-        };
         if self.settings.grab_keyboard {
             let proxy = self.proxy.clone();
             self.key_grab = crate::platform::start_key_grab(Box::new(move |hid, down, repeat| {
@@ -181,9 +202,81 @@ impl App {
         }
         window.set_cursor_visible(false);
         window.focus_window();
+        #[cfg(target_os = "macos")]
+        crate::platform::activate_self();
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.session = Some(session);
+        if !self.attach(el, conn) {
+            return;
+        }
+        let p = shortcut_prefix();
+        let mut lines = vec![
+            format!("Connected to {}", self.host_name),
+            format!("{p}+Q disconnect  ·  {p}+F fullscreen  ·  {p}+M lock mouse  ·  {p}+S stats"),
+        ];
+        if self.settings.grab_keyboard && !self.key_grab && cfg!(target_os = "macos") {
+            lines.push("Cmd+Tab stays on this Mac: give Hop Accessibility permission to send it across.".into());
+        }
+        self.toast(lines, 7);
+    }
+
+    /// Starts streaming on a fresh connection (first connect or after a reconnect).
+    fn attach(&mut self, el: &ActiveEventLoop, conn: Connection) -> bool {
+        self.host_name = conn.host.name.clone();
+        self.host_os = conn.host.os.clone();
+        self.encoder = conn.info.encoder.clone();
+        report("connected", Some(&conn.host));
+        let proxy = self.proxy.clone();
+        match client::start(conn, move |e| {
+            let _ = proxy.send_event(match e {
+                Event::Frame => UserEvent::Frame,
+                Event::Closed(r) => UserEvent::Closed(r),
+            });
+        }) {
+            Ok(s) => {
+                self.session = Some(s);
+                self.reconnecting = None;
+                true
+            }
+            Err(e) => {
+                self.fail(el, EXIT_ERROR, format!("{e:#}"));
+                false
+            }
+        }
+    }
+
+    fn start_reconnect(&mut self, reason: String) {
+        log::info!("{reason}; reconnecting");
+        report("reconnecting", None);
+        self.session = None;
+        self.pressed.clear();
+        self.local_down.clear();
+        self.hotkey_keys.clear();
+        self.reconnecting = Some(Instant::now());
+        let opts = self.settings.connect.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + RECONNECT_FOR;
+            loop {
+                std::thread::sleep(Duration::from_millis(700));
+                match client::connect(&opts) {
+                    Ok(conn) => {
+                        let _ = proxy.send_event(UserEvent::Reconnected(Box::new(conn)));
+                        return;
+                    }
+                    Err(ConnectError::WrongCode) => {
+                        let _ = proxy.send_event(UserEvent::GaveUp("The access code changed".into()));
+                        return;
+                    }
+                    Err(e) if Instant::now() > deadline => {
+                        let _ = proxy.send_event(UserEvent::GaveUp(format!("{reason} ({e})")));
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+        self.paint();
     }
 
     fn send(&self, i: Input) {
@@ -216,7 +309,13 @@ impl App {
         }
         w.set_cursor_visible(false);
         self.rel_accum = (0.0, 0.0);
-        self.update_title(true);
+        if self.mouse_locked {
+            self.toast(vec!["Mouse locked to this window".into(), format!("{}+M to release", shortcut_prefix())], 3);
+        } else if on {
+            self.toast(vec!["Couldn't lock the mouse".into()], 3);
+        } else {
+            self.toast(vec!["Mouse released".into()], 2);
+        }
     }
 
     fn toggle_fullscreen(&self) {
@@ -242,7 +341,7 @@ impl App {
             0x16 => {
                 // S
                 self.show_stats = !self.show_stats;
-                self.update_title(true);
+                self.paint();
             }
             _ => return false,
         }
@@ -291,31 +390,71 @@ impl App {
         }
     }
 
-    fn update_title(&mut self, force: bool) {
-        if !force && self.last_title.elapsed() < Duration::from_secs(1) {
-            return;
+    fn overlay(&mut self) -> Overlay {
+        let mut ov = Overlay::default();
+        if let Some((lines, until)) = &self.toast {
+            if Instant::now() < *until {
+                ov.toast = Some(lines.clone());
+            } else {
+                self.toast = None;
+            }
         }
-        self.last_title = Instant::now();
-        let (Some(w), Some(s)) = (&self.window, &self.session) else { return };
-        let mut t = format!("Hop — {}", self.host_name);
-        if self.mouse_locked {
-            t.push_str("  [mouse locked: Ctrl+Alt+Shift+M to release]");
+        if let Some(since) = self.reconnecting {
+            let left = RECONNECT_FOR.saturating_sub(since.elapsed()).as_secs();
+            ov.banner = Some(("Connection lost".into(), format!("Reconnecting to {}…  ({left}s)", self.host_name)));
+        } else if !self.got_frame && self.session.is_some() {
+            ov.banner = Some(("Waiting for video…".into(), String::new()));
         }
-        if self.show_stats {
+        if self.show_stats
+            && let Some(s) = &self.session
+        {
             let st = s.stats.lock().clone();
-            t.push_str(&format!(
-                "  ·  {}x{} {:.0} fps  ·  {:.1} Mbps  ·  host {:.1} ms  ·  rtt {:.1} ms  ·  decode {:.1} ms  ·  lost {} (fixed {})",
-                st.width, st.height, st.fps, st.mbps, st.host_ms, st.rtt_ms, st.decode_ms, st.lost, st.recovered
-            ));
+            let net = st.rtt_ms / 2.0;
+            ov.stats = Some(vec![
+                format!("{}×{}  {:.0} fps  {:.1} Mbps", st.width, st.height, st.fps, st.mbps),
+                format!("host {:.1} ms + network {:.1} ms + decode {:.1} ms", st.host_ms, net, st.decode_ms),
+                format!("≈ {:.0} ms before display", st.host_ms + net + st.decode_ms),
+                format!("round trip {:.1} ms · lost {} · repaired {}", st.rtt_ms, st.lost, st.recovered),
+                format!("{} → {}", self.encoder, st.decoder),
+            ]);
         }
-        w.set_title(&t);
+        ov
+    }
+
+    fn paint(&mut self) {
+        let ov = self.overlay();
+        let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+        if let Some(w) = &self.window {
+            w.pre_present_notify();
+        }
+        if let Some(r) = &mut self.renderer {
+            r.render(&ov, scale);
+        }
+        self.last_paint = Instant::now();
+    }
+
+    /// Overlay content that changes on its own (countdowns, stats, toasts) needs periodic repaints.
+    fn overlay_is_live(&self) -> bool {
+        self.toast.is_some() || self.reconnecting.is_some() || self.show_stats || (!self.got_frame && self.session.is_some())
     }
 }
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.session.is_none() && self.exit_message.is_none() {
+        if self.window.is_none() && self.exit_message.is_none() {
             self.connect(el);
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.overlay_is_live() {
+            let next = self.last_paint + Duration::from_millis(250);
+            if Instant::now() >= next {
+                self.paint();
+            }
+            el.set_control_flow(ControlFlow::WaitUntil(self.last_paint + Duration::from_millis(250)));
+        } else {
+            el.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -326,11 +465,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(f) = s.frame.lock().take() else { return };
                 r.upload(&f);
                 s.recycle(f);
-                if let Some(w) = &self.window {
-                    w.pre_present_notify();
-                }
-                r.render();
-                self.update_title(false);
+                self.got_frame = true;
+                self.paint();
             }
             UserEvent::Key { hid, down, repeat } => {
                 if self.focused {
@@ -338,9 +474,29 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Closed(reason) => {
-                let code = if reason.is_empty() { EXIT_OK } else { EXIT_ERROR };
-                self.fail(el, code, reason);
+                if self.session.as_ref().is_some_and(|s| s.stop.load(std::sync::atomic::Ordering::Relaxed))
+                    && reason.is_empty()
+                {
+                    return el.exit();
+                }
+                // The host deliberately ended things: don't fight it.
+                let deliberate = reason.is_empty()
+                    || reason.contains("ended the session")
+                    || reason.contains("display is now")
+                    || reason.contains("permission");
+                if deliberate {
+                    let code = if reason.is_empty() { EXIT_OK } else { EXIT_ERROR };
+                    self.fail(el, code, reason);
+                } else {
+                    self.start_reconnect(reason);
+                }
             }
+            UserEvent::Reconnected(conn) => {
+                if self.attach(el, *conn) {
+                    self.toast(vec![format!("Reconnected to {}", self.host_name)], 3);
+                }
+            }
+            UserEvent::GaveUp(reason) => self.fail(el, EXIT_ERROR, reason),
         }
     }
 
@@ -353,14 +509,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(s) => {
                 if let Some(r) = &mut self.renderer {
                     r.resize(s.width, s.height);
-                    r.render();
                 }
+                self.paint();
             }
-            WindowEvent::RedrawRequested => {
-                if let Some(r) = &mut self.renderer {
-                    r.render();
-                }
-            }
+            WindowEvent::RedrawRequested | WindowEvent::ScaleFactorChanged { .. } => self.paint(),
             WindowEvent::Focused(f) => {
                 self.focused = f;
                 if !f {

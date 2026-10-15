@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::clipboard::ClipState;
-use crate::crypto::{PacketCipher, StreamCipher, host_handshake, read_frame, write_frame};
+use crate::crypto::{PacketCipher, StreamCipher, host_handshake, host_refuse, read_frame, write_frame};
 use crate::media::{AUDIO_FRAMES_PER_PACKET, KIND_AUDIO, KIND_PUNCH, KIND_VIDEO, Packetizer, encode_audio};
 use crate::platform::{self, CaptureConfig, Capturer, FrameSink};
 use crate::proto::{CONTROL_PORT, Ctrl, Hello, Input, MEDIA_PORT, Message, PROTOCOL_VERSION, decode_message, encode_ctrl};
@@ -72,6 +72,13 @@ pub struct Host {
 }
 
 impl Host {
+    /// Ends the current remote session, if any.
+    pub fn disconnect(&self) {
+        if let Some(a) = self.shared.active.lock().clone() {
+            a.kick();
+        }
+    }
+
     pub fn stop(&self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         if let Some(a) = self.shared.active.lock().clone() {
@@ -125,7 +132,7 @@ pub fn start_host(opts: HostOptions) -> Result<Host> {
     let sh = shared.clone();
     std::thread::Builder::new().name("host-punch".into()).spawn(move || punch_loop(sh))?;
 
-    log::info!("hosting on TCP {CONTROL_PORT} / UDP {MEDIA_PORT}");
+    log::info!("hosting \"{}\" on TCP {CONTROL_PORT} / UDP {MEDIA_PORT}", shared.name);
     Ok(Host { status, shared })
 }
 
@@ -182,38 +189,41 @@ fn handle_client(shared: &Arc<Shared>, mut s: TcpStream, peer: SocketAddr) -> Re
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
-    {
-        let f = shared.failures.lock();
-        if let Some(until) = f.1
-            && Instant::now() < until
-        {
-            bail!("refusing {peer}: too many wrong access codes, try again in a minute");
-        }
-    }
     let code = shared.code.lock().clone();
     let me = Hello {
         hop: PROTOCOL_VERSION,
         id: shared.id.clone(),
         name: shared.name.clone(),
         os: crate::proto::os_name().into(),
+        error: None,
     };
+    let locked = shared.failures.lock().1.filter(|until| Instant::now() < *until);
+    if let Some(until) = locked {
+        let secs = (until - Instant::now()).as_secs() + 1;
+        let _ = host_refuse(&mut s, &me, &format!("Too many wrong access codes. Try again in {secs} s."));
+        bail!("refusing {peer}: locked after wrong access codes");
+    }
     let (client, keys) = host_handshake(&mut s, &code, &me)?;
     let mut tx = StreamCipher::new(&keys.s2c);
     let mut rx = StreamCipher::new(&keys.c2s);
     let native = platform::native_display_size();
     send_ctrl(&mut s, &mut tx, &Ctrl::Welcome { native_width: native.0, native_height: native.1 })?;
 
-    let first = read_frame(&mut s)?;
-    let start = match rx.open(&first) {
-        Ok(b) => b,
-        Err(_) => {
-            std::thread::sleep(Duration::from_secs(1));
-            let mut f = shared.failures.lock();
-            f.0 += 1;
-            if f.0 >= 5 {
-                f.0 = 0;
-                f.1 = Some(Instant::now() + Duration::from_secs(60));
+    // A client with the wrong code can't read our Welcome and hangs up, so a dropped connection
+    // here counts as a failed attempt too (otherwise guessing would never be rate limited).
+    let start = match read_frame(&mut s).ok().and_then(|f| rx.open(&f).ok()) {
+        Some(b) => b,
+        None => {
+            {
+                let mut f = shared.failures.lock();
+                f.0 += 1;
+                if f.0 >= 5 {
+                    f.0 = 0;
+                    f.1 = Some(Instant::now() + Duration::from_secs(60));
+                }
             }
+            // Slow down guessing.
+            std::thread::sleep(Duration::from_secs(1));
             bail!("{} ({peer}) used the wrong access code", client.name);
         }
     };

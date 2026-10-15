@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use eframe::egui;
+use eframe::egui_wgpu;
 use winit::window::Window;
 
 use crate::platform::Nv12Frame;
@@ -31,6 +33,20 @@ struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 }
 "#;
 
+/// Text drawn over the video: a toast at the top, a centered banner, a stats panel.
+#[derive(Default)]
+pub struct Overlay {
+    pub toast: Option<Vec<String>>,
+    pub banner: Option<(String, String)>,
+    pub stats: Option<Vec<String>>,
+}
+
+impl Overlay {
+    pub fn is_empty(&self) -> bool {
+        self.toast.is_none() && self.banner.is_none() && self.stats.is_none()
+    }
+}
+
 struct VideoTextures {
     width: u32,
     height: u32,
@@ -50,6 +66,9 @@ pub struct Renderer {
     video: Option<VideoTextures>,
     #[allow(dead_code)]
     pub adapter_name: String,
+    egui: egui::Context,
+    egui_renderer: egui_wgpu::Renderer,
+    started: std::time::Instant,
 }
 
 impl Renderer {
@@ -147,7 +166,21 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        Ok(Self { surface, device, queue, config, pipeline, layout, sampler, video: None, adapter_name })
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions::default());
+        Ok(Self {
+            surface,
+            device,
+            queue,
+            config,
+            pipeline,
+            layout,
+            sampler,
+            video: None,
+            adapter_name,
+            egui: egui::Context::default(),
+            egui_renderer,
+            started: std::time::Instant::now(),
+        })
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -223,7 +256,7 @@ impl Renderer {
         (((ww - w) / 2.0).floor(), ((wh - h) / 2.0).floor(), w.round(), h.round())
     }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self, overlay: &Overlay, scale: f32) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -255,8 +288,103 @@ impl Renderer {
                 }
             }
         }
+        if !overlay.is_empty() {
+            self.paint_overlay(&mut enc, &view, overlay, scale);
+        }
         self.queue.submit([enc.finish()]);
         self.queue.present(frame);
+    }
+
+    fn paint_overlay(&mut self, enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, ov: &Overlay, scale: f32) {
+        let (w, h) = (self.config.width, self.config.height);
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / scale, h as f32 / scale))),
+            time: Some(self.started.elapsed().as_secs_f64()),
+            ..Default::default()
+        };
+        if let Some(v) = raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+            v.native_pixels_per_point = Some(scale);
+        }
+        let panel = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_black_alpha(185))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| add(ui));
+        };
+        let out = self.egui.run_ui(raw, |ui| {
+            let ctx = ui.ctx().clone();
+            if let Some(lines) = &ov.stats {
+                egui::Area::new(egui::Id::new("stats")).anchor(egui::Align2::LEFT_TOP, [12.0, 12.0]).interactable(false).show(
+                    &ctx,
+                    |ui| {
+                        panel(ui, &mut |ui| {
+                            for l in lines {
+                                ui.label(egui::RichText::new(l).monospace().size(12.5).color(egui::Color32::WHITE));
+                            }
+                        })
+                    },
+                );
+            }
+            if let Some(lines) = &ov.toast {
+                egui::Area::new(egui::Id::new("toast")).anchor(egui::Align2::CENTER_TOP, [0.0, 18.0]).interactable(false).show(
+                    &ctx,
+                    |ui| {
+                        panel(ui, &mut |ui| {
+                            for (i, l) in lines.iter().enumerate() {
+                                let t = egui::RichText::new(l);
+                                ui.label(if i == 0 {
+                                    t.size(16.0).strong().color(egui::Color32::WHITE)
+                                } else {
+                                    t.size(13.0).color(egui::Color32::from_gray(215))
+                                });
+                            }
+                        })
+                    },
+                );
+            }
+            if let Some((title, detail)) = &ov.banner {
+                egui::Area::new(egui::Id::new("banner")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).interactable(false).show(
+                    &ctx,
+                    |ui| {
+                        panel(ui, &mut |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new(title).size(20.0).strong().color(egui::Color32::WHITE));
+                                if !detail.is_empty() {
+                                    ui.label(egui::RichText::new(detail).size(14.0).color(egui::Color32::from_gray(215)));
+                                }
+                            });
+                        })
+                    },
+                );
+            }
+        });
+        let jobs = self.egui.tessellate(out.shapes, out.pixels_per_point);
+        for (id, deltas) in &out.textures_delta.set {
+            for delta in deltas {
+                self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+            }
+        }
+        let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: out.pixels_per_point };
+        self.egui_renderer.update_buffers(&self.device, &self.queue, enc, &jobs, &sd);
+        {
+            let mut pass = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("overlay"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut pass, &jobs, &sd);
+        }
+        for id in &out.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
     }
 }
 

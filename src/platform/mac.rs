@@ -46,6 +46,17 @@ unsafe extern "C" {
     fn hop_mac_begin_activity();
     fn hop_mac_prevent_sleep(on: i32);
     fn hop_mac_keytap_start(ctx: *mut c_void, cb: KeyCb) -> i32;
+    fn hop_mac_yield_activation(pid: i32) -> i32;
+    fn hop_mac_activate_self();
+}
+
+/// Lets the viewer process take focus (macOS 14+ cooperative activation). False until it has started.
+pub fn yield_activation(pid: u32) -> bool {
+    unsafe { hop_mac_yield_activation(pid as i32) != 0 }
+}
+
+pub fn activate_self() {
+    unsafe { hop_mac_activate_self() }
 }
 
 /// Called with (hid, down, repeat) for every key while the viewer is frontmost.

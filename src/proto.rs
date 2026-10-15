@@ -16,6 +16,9 @@ pub struct Hello {
     pub id: String,
     pub name: String,
     pub os: String,
+    /// Set by a host that refuses the connection (e.g. after too many wrong codes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Encrypted JSON control messages (both directions).

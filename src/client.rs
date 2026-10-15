@@ -10,11 +10,12 @@ use parking_lot::Mutex;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::clipboard::ClipState;
-use crate::crypto::{PacketCipher, SessionKeys, StreamCipher, client_handshake, read_frame, write_frame};
+use crate::crypto::{HostRefused, PacketCipher, SessionKeys, StreamCipher, client_handshake, read_frame, write_frame};
 use crate::media::{KIND_AUDIO, KIND_PUNCH, KIND_VIDEO, Reassembler, decode_audio};
 use crate::platform::{self, DecodeStatus, Nv12Frame};
 use crate::proto::{CONTROL_PORT, Ctrl, Hello, Input, MEDIA_PORT, Message, PROTOCOL_VERSION, decode_message, encode_ctrl, encode_input};
 
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub addr: String,
     pub code: String,
@@ -88,8 +89,17 @@ pub fn connect(o: &ConnectOptions) -> Result<Connection, ConnectError> {
     tcp.set_nodelay(true).ok();
     tcp.set_read_timeout(Some(Duration::from_secs(10))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    let me = Hello { hop: PROTOCOL_VERSION, id: o.id.clone(), name: o.name.clone(), os: crate::proto::os_name().into() };
-    let (host, keys) = client_handshake(&mut tcp, &o.code, &me)?;
+    let me = Hello {
+        hop: PROTOCOL_VERSION,
+        id: o.id.clone(),
+        name: o.name.clone(),
+        os: crate::proto::os_name().into(),
+        error: None,
+    };
+    let (host, keys) = client_handshake(&mut tcp, &o.code, &me).map_err(|e| match e.downcast::<HostRefused>() {
+        Ok(r) => ConnectError::Host(r.0),
+        Err(e) => ConnectError::Other(e),
+    })?;
     let mut tx = StreamCipher::new(&keys.c2s);
     let mut rx = StreamCipher::new(&keys.s2c);
     let welcome = read_frame(&mut tcp).map_err(|e| ConnectError::Other(e.context("host closed the connection")))?;
