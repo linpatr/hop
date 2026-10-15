@@ -1,6 +1,6 @@
 [package]
 name = "hop"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 
 [dependencies]
@@ -31,6 +31,7 @@ wgpu = "30"
 arboard = { version = "3.6.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -42,6 +43,9 @@ windows = { version = "0.62", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Com_Urlmon",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
@@ -51,6 +55,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

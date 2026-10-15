@@ -505,14 +505,14 @@ impl Launcher {
                 VdState::Busy(what) => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(format!("{what}… approve the Windows prompt if it asks."));
+                        ui.label(format!("{what}… approve the Windows prompts (admin, then Install)."));
                     });
                 }
                 VdState::NotInstalled | VdState::Failed(_) => {
                     ui.label("With the monitor off, Windows draws nothing, so there's nothing to stream. A virtual display fixes that.");
                     ui.label(
                         RichText::new(
-                            "Installs the free, open-source Virtual Display Driver (github.com/VirtualDrivers). Windows asks for admin permission once.",
+                            "Installs the free, open-source Virtual Display Driver (github.com/VirtualDrivers). Windows asks for admin permission, then whether to install the driver: click Install.",
                         )
                         .weak(),
                     );

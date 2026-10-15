@@ -17,7 +17,9 @@ Low-latency remote desktop for two computers on the same network. Either compute
 - **Download:** get `Hop.exe` from the latest [release](https://github.com/linpatr/hop/releases/latest), run it (SmartScreen: "More info" → "Run anyway", since the exe isn't code-signed) and click **Install Hop**.
 - **From a Mac running Hop** (no internet needed): run `iwr http://<mac-ip>:47123/install.ps1 | iex`. The exact command, with the Mac's IP filled in, is shown in the Mac's Hop window.
 
-All three install to `%LOCALAPPDATA%\Programs\Hop`, add a Start menu shortcut and a sign-in entry, and add a firewall rule (one admin prompt).
+The one-liners download Hop.exe and open it. Then click **Install Hop**: it copies Hop to `%LOCALAPPDATA%\Programs\Hop`, adds a Start menu shortcut and a sign-in entry, and adds a firewall rule (one Windows admin prompt naming Hop). Running a newer Hop.exe and clicking Install again updates it.
+
+**Windows Defender says "Trojan:Win32/Bearfoos"?** That's Defender's machine-learning guess (detections ending in `!ml`). It often flags new programs that aren't code-signed, especially remote-control tools, because they capture the screen and send keystrokes the way the real thing does. Hop is built from this source code. To use it anyway, restore it in Windows Security → Protection history ("Allow on device"). Microsoft clears false positives submitted at https://www.microsoft.com/en-us/wdsi/filesubmission (as "Software developer", "Incorrect detection").
 
 Then, on either computer, click **Connect** next to the other one. The first time, type the access code shown on the other computer. It's remembered after that.
 

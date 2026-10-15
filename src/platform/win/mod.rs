@@ -5,6 +5,7 @@ mod input;
 mod keyhook;
 mod mfdec;
 mod mfenc;
+pub mod shell;
 pub mod vdisplay;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

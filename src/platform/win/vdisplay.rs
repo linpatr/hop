@@ -6,13 +6,13 @@
 //! monitor. Hop keeps it detached while a real monitor is in use; when the real one goes away,
 //! Windows switches to the virtual one by itself, and Hop sets it to the viewer's resolution.
 //!
-//! Installing needs admin once. Everything else here works as a normal user.
+//! Installing needs admin once (Windows asks, then asks whether to install the driver).
+//! Everything else here works as a normal user.
 
-use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use windows::Win32::Graphics::Gdi::{
     CDS_NORESET, CDS_TYPE, CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
     DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, DM_DISPLAYFREQUENCY,
@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::core::PCWSTR;
 
-const NO_WINDOW: u32 = 0x0800_0000;
+use super::shell;
 
 const DRIVER_URL: &str =
     "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip";
@@ -180,94 +180,94 @@ pub fn prepare_for_stream(max: (u32, u32), fps: u32) -> bool {
     }
 }
 
-fn script(action: &str) -> String {
-    format!(
-        r#"$ErrorActionPreference = 'Stop'
-$result = Join-Path $env:TEMP 'hop-vdd.result'
-Remove-Item $result -ErrorAction SilentlyContinue
-try {{
-    $ProgressPreference = 'SilentlyContinue'
-    $tmp = Join-Path $env:TEMP 'HopVDD'
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Path $tmp | Out-Null
-    function Get-Checked($url, $sha, $out) {{
-        Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-        if ((Get-FileHash $out -Algorithm SHA256).Hash -ne $sha) {{ throw "download didn't match its checksum: $url" }}
-    }}
-    Get-Checked '{NEFCON_URL}' '{NEFCON_SHA256}' "$tmp\nefcon.zip"
-    Expand-Archive "$tmp\nefcon.zip" -DestinationPath "$tmp\nefcon" -Force
-    $nefcon = "$tmp\nefcon\x64\nefconc.exe"
-    if ('{action}' -eq 'remove') {{
-        & $nefcon --remove-device-node --hardware-id 'Root\MttVDD' --class-guid '4D36E968-E325-11CE-BFC1-08002BE10318'
-        if ($LASTEXITCODE -ne 0) {{ throw "removing the driver failed (nefcon exit $LASTEXITCODE)" }}
-    }} else {{
-        Get-Checked '{DRIVER_URL}' '{DRIVER_SHA256}' "$tmp\vdd.zip"
-        Expand-Archive "$tmp\vdd.zip" -DestinationPath "$tmp\vdd" -Force
-        $drv = "$tmp\vdd\VirtualDisplayDriver"
-        New-Item -ItemType Directory -Path 'C:\VirtualDisplayDriver' -Force | Out-Null
-        if (-not (Test-Path 'C:\VirtualDisplayDriver\vdd_settings.xml')) {{
-            Copy-Item "$drv\vdd_settings.xml" 'C:\VirtualDisplayDriver\vdd_settings.xml'
-        }}
-        # Trust the driver's signer (SignPath), as the project's own installer does, so Windows
-        # doesn't stop to ask.
-        $certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
-        $certs.Import([IO.File]::ReadAllBytes("$drv\mttvdd.cat"))
-        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
-        $store.Open('ReadWrite')
-        foreach ($c in $certs) {{ $store.Add($c) }}
-        $store.Close()
-        & $nefcon install "$drv\MttVDD.inf" 'Root\MttVDD'
-        if ($LASTEXITCODE -ne 0) {{ throw "installing the driver failed (nefcon exit $LASTEXITCODE)" }}
-    }}
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    'OK' | Set-Content $result
-}} catch {{
-    ($_ | Out-String) | Set-Content $result
-    exit 1
-}}
-"#
-    )
+fn sha256_hex(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let data = std::fs::read(path)?;
+    Ok(Sha256::digest(&data).iter().map(|b| format!("{b:02X}")).collect())
 }
 
-/// Installs ("install") or removes ("remove") the driver. Shows one admin prompt and blocks
-/// until it's done.
+/// Downloads a file and checks it against a fixed SHA-256, so a tampered download is refused.
+fn fetch_checked(url: &str, sha256: &str, dest: &Path) -> Result<()> {
+    shell::download(url, dest)?;
+    let got = sha256_hex(dest)?;
+    if got != sha256 {
+        let _ = std::fs::remove_file(dest);
+        bail!("the download from {url} didn't match its expected checksum, so it wasn't used");
+    }
+    Ok(())
+}
+
+fn extract(zip_path: &Path, name: &str, dest: &Path) -> Result<()> {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
+    let mut f = zip.by_name(name).with_context(|| format!("{name} missing from {}", zip_path.display()))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::io::copy(&mut f, &mut std::fs::File::create(dest)?)?;
+    Ok(())
+}
+
+/// Installs ("install") or removes ("remove") the driver, using the signed device installer
+/// nefcon. Windows shows an admin prompt, and when installing, asks whether to install the
+/// driver. Blocks until done.
 pub fn run_setup(action: &str) -> Result<()> {
-    let temp = std::env::temp_dir();
-    let ps1 = temp.join(format!("hop-vdd-{action}.ps1"));
-    std::fs::write(&ps1, script(action)).context("writing the setup script")?;
-    let result = temp.join("hop-vdd.result");
-    let _ = std::fs::remove_file(&result);
-    let elevate = format!(
-        "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
-        ps1.display().to_string().replace('\'', "''")
-    );
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &elevate])
-        .creation_flags(NO_WINDOW)
-        .status()
-        .context("starting PowerShell")?;
-    let _ = std::fs::remove_file(&ps1);
-    let outcome = std::fs::read_to_string(&result).unwrap_or_default();
-    let _ = std::fs::remove_file(&result);
-    if outcome.trim() == "OK" {
-        log::info!("virtual display driver {action} finished");
-    } else if outcome.trim().is_empty() {
-        bail!(if status.success() { "setup was cancelled" } else { "setup didn't run (was the admin prompt declined?)" });
-    } else {
-        return Err(anyhow!("{}", outcome.trim()));
-    }
-    if action == "install" {
-        // The driver adds its display to the desktop; take it off again while the real
-        // monitor is in use.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline && !is_installed() {
-            std::thread::sleep(Duration::from_millis(500));
+    let work = std::env::temp_dir().join("HopVDD");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)?;
+    let result = setup_in(&work, action);
+    let _ = std::fs::remove_dir_all(&work);
+    result
+}
+
+fn setup_in(work: &Path, action: &str) -> Result<()> {
+    let nefcon_zip = work.join("nefcon.zip");
+    fetch_checked(NEFCON_URL, NEFCON_SHA256, &nefcon_zip)?;
+    let nefconc = work.join("nefconc.exe");
+    extract(&nefcon_zip, "x64/nefconc.exe", &nefconc)?;
+
+    if action == "remove" {
+        let code = shell::run_elevated(
+            &nefconc,
+            r"--remove-device-node --hardware-id Root\MttVDD --class-guid 4D36E968-E325-11CE-BFC1-08002BE10318",
+        )?;
+        if code != 0 {
+            bail!("removing the driver failed (nefcon exit code {code})");
         }
-        if !is_installed() {
-            bail!("the driver installed, but its display hasn't appeared yet; restarting Windows may help");
-        }
-        std::thread::sleep(Duration::from_secs(2));
-        tidy();
+        log::info!("virtual display driver removed");
+        return Ok(());
     }
+
+    let driver_zip = work.join("vdd.zip");
+    fetch_checked(DRIVER_URL, DRIVER_SHA256, &driver_zip)?;
+    let drv = work.join("VirtualDisplayDriver");
+    for f in ["MttVDD.inf", "MttVDD.dll", "mttvdd.cat", "vdd_settings.xml"] {
+        extract(&driver_zip, &format!("VirtualDisplayDriver/{f}"), &drv.join(f))?;
+    }
+    // The driver reads its settings (resolutions etc.) from here. Users may create folders in
+    // C:\, so this doesn't need admin.
+    let conf = Path::new(r"C:\VirtualDisplayDriver");
+    std::fs::create_dir_all(conf).context(r"couldn't create C:\VirtualDisplayDriver")?;
+    if !conf.join("vdd_settings.xml").exists() {
+        std::fs::copy(drv.join("vdd_settings.xml"), conf.join("vdd_settings.xml"))
+            .context("couldn't write the virtual display settings")?;
+    }
+    let inf = drv.join("MttVDD.inf");
+    let code = shell::run_elevated(&nefconc, &format!("install \"{}\" Root\\MttVDD", inf.display()))?;
+    if code != 0 && code != 3010 {
+        bail!("installing the driver failed (nefcon exit code {code}); if Windows asked whether to install it, click Install");
+    }
+    log::info!("virtual display driver installed (exit code {code})");
+
+    // The driver adds its display to the desktop; take it off again while the real monitor is
+    // in use.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !is_installed() {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if !is_installed() {
+        bail!("the driver installed, but its display hasn't appeared yet; restarting Windows may help");
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    tidy();
     Ok(())
 }

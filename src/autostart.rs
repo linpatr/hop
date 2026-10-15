@@ -54,18 +54,10 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    const NO_WINDOW: u32 = 0x0800_0000;
-
-    fn reg(args: &[&str]) -> bool {
-        Command::new("reg").args(args).creation_flags(NO_WINDOW).output().map(|o| o.status.success()).unwrap_or(false)
-    }
+    use crate::platform::shell;
 
     pub fn enabled() -> bool {
-        reg(&["query", KEY, "/v", "Hop"])
+        shell::run_key_exists("Hop")
     }
 
     pub fn available() -> bool {
@@ -73,14 +65,13 @@ mod imp {
     }
 
     pub fn set(on: bool) -> std::io::Result<()> {
-        let ok = if on {
+        let cmd = if on {
             let exe = std::env::current_exe()?;
-            let value = format!("\"{}\" --minimized", exe.display());
-            reg(&["add", KEY, "/v", "Hop", "/t", "REG_SZ", "/d", &value, "/f"])
+            Some(format!("\"{}\" --minimized", exe.display()))
         } else {
-            reg(&["delete", KEY, "/v", "Hop", "/f"]) || !enabled()
+            None
         };
-        if ok { Ok(()) } else { Err(std::io::Error::other("registry update failed")) }
+        shell::set_run_key("Hop", cmd.as_deref()).map_err(|e| std::io::Error::other(format!("{e:#}")))
     }
 }
 

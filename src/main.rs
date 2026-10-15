@@ -53,6 +53,8 @@ fn main() {
             logging::init("hop-viewer.log");
             run_connect(&args[1..])
         }
+        // Run by the installer with admin rights (one Windows prompt naming Hop).
+        Some("admin-firewall") => install::admin_firewall(args.get(1).map(String::as_str).unwrap_or_default()),
         Some("selftest") => {
             logging::init("hop-selftest.log");
             selftest::run()
