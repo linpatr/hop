@@ -6,16 +6,18 @@ Low-latency remote desktop for two computers on the same network. Either compute
 
 **Mac:** `/Applications/Hop.app`. The window shows this Mac's **access code** and lists the other computers it can see.
 
-**Windows**, either way:
+**Windows**, any of these:
 
-- **From GitHub:** sign in to GitHub on the PC, download `Hop.exe` from the latest [release](https://github.com/linpatr/hop/releases/latest), run it (SmartScreen: "More info" → "Run anyway", since the exe isn't code-signed) and click **Install Hop**.
-- **From the Mac:** with Hop open on the Mac, run this in PowerShell on the PC (the command also appears in the Mac's Hop window):
+- **One line in PowerShell:**
 
   ```powershell
-  iwr http://<mac-ip>:47123/install.ps1 | iex
+  iwr https://github.com/linpatr/hop/releases/latest/download/install.ps1 | iex
   ```
 
-Both install to `%LOCALAPPDATA%\Programs\Hop`, add a Start menu shortcut and a sign-in entry, and add a firewall rule (one admin prompt).
+- **Download:** get `Hop.exe` from the latest [release](https://github.com/linpatr/hop/releases/latest), run it (SmartScreen: "More info" → "Run anyway", since the exe isn't code-signed) and click **Install Hop**.
+- **From a Mac running Hop** (no internet needed): run `iwr http://<mac-ip>:47123/install.ps1 | iex`. The exact command, with the Mac's IP filled in, is shown in the Mac's Hop window.
+
+All three install to `%LOCALAPPDATA%\Programs\Hop`, add a Start menu shortcut and a sign-in entry, and add a firewall rule (one admin prompt).
 
 Then, on either computer, click **Connect** next to the other one. The first time, type the access code shown on the other computer. It's remembered after that.
 
